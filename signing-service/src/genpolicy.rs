@@ -810,6 +810,15 @@ fn enclava_init_container() -> Result<Value> {
         "name": "enclava-init",
         "image": enclava_init_image()?,
         "command": ["/usr/local/bin/enclava-init"],
+        "readinessProbe": {
+            "exec": {
+                "command": ["/usr/local/bin/enclava-init", "--probe-ready"],
+            },
+            "failureThreshold": 17280,
+            "periodSeconds": 5,
+            "successThreshold": 1,
+            "timeoutSeconds": 2,
+        },
         "env": with_kubernetes_service_env(vec![
             value_env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
             value_env("ENCLAVA_INIT_STAY_ALIVE", "true"),
@@ -962,6 +971,8 @@ mod tests {
             .manifest_yaml
             .contains("- /usr/local/bin/enclava-wait-exec"));
         assert!(invocation.manifest_yaml.contains("$(privileged_caps)"));
+        assert!(invocation.manifest_yaml.contains("readinessProbe:"));
+        assert!(invocation.manifest_yaml.contains("--probe-ready"));
         assert!(invocation.manifest_yaml.contains("- name: A"));
         assert!(invocation.manifest_yaml.contains("value: '1'"));
     }
