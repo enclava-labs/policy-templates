@@ -273,11 +273,43 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     }
 
     let normalized = lines.concat();
+    let normalized = normalize_cap_overlay_root_path(&normalized);
+    let normalized = normalize_cap_sandbox_pidns(&normalized);
     let normalized = normalize_rootfs_propagation(&normalized);
     let normalized = normalize_cap_storage_mounts(&normalized);
     let normalized = normalize_cap_sandbox_storages(&normalized);
     let normalized = normalize_cap_extra_storages(&normalized);
     normalize_privileged_caps_placeholder(&normalized)
+}
+
+fn normalize_cap_overlay_root_path(policy_text: &str) -> String {
+    const DEFAULT_ROOT_PATH: &str = r#""root_path": "/run/kata-containers/$(bundle-id)/rootfs""#;
+    const OVERLAY_ROOT_PATH: &str =
+        r#""root_path": "/run/kata-containers/(shared/containers/)?$(bundle-id)/rootfs""#;
+
+    policy_text.replace(DEFAULT_ROOT_PATH, OVERLAY_ROOT_PATH)
+}
+
+fn normalize_cap_sandbox_pidns(policy_text: &str) -> String {
+    const PIDNS_CHECK: &str = "    p_pidns == i_pidns\n";
+    const PIDNS_ALLOW: &str = "    allow_cap_sandbox_pidns(p_container, p_pidns, i_pidns)\n";
+    const PIDNS_HELPERS: &str = r#"
+allow_cap_sandbox_pidns(_p_container, p_pidns, i_pidns) if {
+    p_pidns == i_pidns
+}
+
+allow_cap_sandbox_pidns(p_container, _p_pidns, i_pidns) if {
+    p_container.OCI.Annotations["io.kubernetes.cri.container-type"] == "sandbox"
+    i_pidns == false
+}
+"#;
+
+    if policy_text.contains("allow_cap_sandbox_pidns") || !policy_text.contains(PIDNS_CHECK) {
+        return policy_text.to_string();
+    }
+
+    let normalized = policy_text.replace(PIDNS_CHECK, PIDNS_ALLOW);
+    insert_policy_helper(&normalized, PIDNS_HELPERS)
 }
 
 fn normalize_rootfs_propagation(policy_text: &str) -> String {
@@ -1049,6 +1081,48 @@ allow_create_container_input if {
         assert!(normalized.contains("rootfs_propagation == \"rshared\""));
         assert!(normalized.contains("rootfs_propagation == \"rslave\""));
         assert!(!normalized.contains("count(i_linux.RootfsPropagation) == 0"));
+    }
+
+    #[test]
+    fn allows_kata_overlay_shared_container_rootfs_paths() {
+        let policy = r#"policy_data := {
+  "common": {
+    "root_path": "/run/kata-containers/$(bundle-id)/rootfs"
+  }
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(normalized.contains(
+            r#""root_path": "/run/kata-containers/(shared/containers/)?$(bundle-id)/rootfs""#
+        ));
+        assert!(!normalized.contains(r#""root_path": "/run/kata-containers/$(bundle-id)/rootfs""#));
+    }
+
+    #[test]
+    fn allows_sandbox_container_without_shared_pid_namespace() {
+        let policy = r#"default AllowRequestsFailingPolicy := false
+
+allow_create_container_input(p_container) if {
+    p_pidns := p_container.sandbox_pidns
+    i_pidns := input.sandbox_pidns
+    print("CreateContainerRequest: p_pidns =", p_pidns, "i_pidns =", i_pidns)
+    p_pidns == i_pidns
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(normalized.contains("allow_cap_sandbox_pidns(p_container, p_pidns, i_pidns)"));
+        assert!(normalized.contains(
+            r#"p_container.OCI.Annotations["io.kubernetes.cri.container-type"] == "sandbox""#
+        ));
+        assert!(normalized.contains("i_pidns == false"));
+        assert!(normalized.contains(
+            r#"print("CreateContainerRequest: p_pidns =", p_pidns, "i_pidns =", i_pidns)
+    allow_cap_sandbox_pidns(p_container, p_pidns, i_pidns)"#
+        ));
     }
 
     #[test]
