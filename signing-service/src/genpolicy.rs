@@ -422,6 +422,7 @@ fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
         },
         "spec": {
             "runtimeClassName": descriptor.expected_runtime_class,
+            "shareProcessNamespace": true,
             "securityContext": {
                 "fsGroup": 10001,
                 "supplementalGroups": [6],
@@ -525,20 +526,11 @@ fn mount(name: &str, mount_path: &str, read_only: bool) -> Value {
     })
 }
 
-fn mount_with_propagation(name: &str, mount_path: &str, propagation: &str) -> Value {
-    json!({
-        "name": name,
-        "mountPath": mount_path,
-        "mountPropagation": propagation,
-    })
-}
-
-fn mount_with_subpath(name: &str, mount_path: &str, sub_path: &str, propagation: &str) -> Value {
+fn mount_with_subpath(name: &str, mount_path: &str, sub_path: &str) -> Value {
     json!({
         "name": name,
         "mountPath": mount_path,
         "subPath": sub_path,
-        "mountPropagation": propagation,
     })
 }
 
@@ -602,7 +594,7 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
     let mut volume_mounts = vec![
         mount("startup", "/startup", true),
         mount("unlock-socket", "/run/enclava", false),
-        mount_with_propagation("state-mount", "/state", "HostToContainer"),
+        mount("state-mount", "/state", false),
     ];
     for storage_path in oci
         .mounts
@@ -615,7 +607,6 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
             "state-mount",
             storage_path,
             &storage_subdir(storage_path),
-            "HostToContainer",
         ));
     }
 
@@ -703,8 +694,8 @@ fn tenant_ingress_container(descriptor: &DeploymentDescriptor) -> Value {
         "volumeMounts": [
             mount("tenant-ingress-caddyfile", "/etc/caddy", true),
             mount("unlock-socket", "/run/enclava", false),
-            mount_with_propagation("state-mount", "/state", "HostToContainer"),
-            mount_with_propagation("tls-state-mount", "/state/tls-state", "HostToContainer"),
+            mount("state-mount", "/state", false),
+            mount("tls-state-mount", "/state/tls-state", false),
         ],
         "securityContext": security_context(10002, 10002, true, false, false, caps(&["ALL"], &["NET_BIND_SERVICE"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
@@ -724,8 +715,8 @@ fn enclava_init_container() -> Result<Value> {
             value_env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "web,tenant-ingress"),
         ]),
         "volumeMounts": [
-            mount_with_propagation("state-mount", "/state", "Bidirectional"),
-            mount_with_propagation("tls-state-mount", "/state/tls-state", "Bidirectional"),
+            mount("state-mount", "/state", false),
+            mount("tls-state-mount", "/state/tls-state", false),
             mount("unlock-socket", "/run/enclava", false),
             mount("enclava-init-config", "/etc/enclava-init", true),
         ],
@@ -850,6 +841,10 @@ mod tests {
             .manifest_yaml
             .contains("automountServiceAccountToken"));
         assert!(!invocation.manifest_yaml.contains("enableServiceLinks"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("shareProcessNamespace: true"));
+        assert!(!invocation.manifest_yaml.contains("mountPropagation"));
         assert!(invocation.manifest_yaml.contains("fsGroup: 10001"));
         assert!(invocation.manifest_yaml.contains("supplementalGroups:"));
         assert!(!invocation.manifest_yaml.contains("defaultMode"));
