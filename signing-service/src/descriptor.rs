@@ -115,6 +115,7 @@ pub struct DeploymentDescriptor {
     pub expected_firmware_measurement: [u8; 32],
     pub expected_runtime_class: String,
     pub kbs_resource_path: String,
+    pub unlock_mode: String,
 
     pub policy_template_id: String,
     #[serde(with = "hex_bytes32")]
@@ -339,6 +340,7 @@ fn descriptor_records<'a>(
             descriptor.expected_runtime_class.as_bytes(),
         ),
         ("kbs_resource_path", descriptor.kbs_resource_path.as_bytes()),
+        ("unlock_mode", descriptor.unlock_mode.as_bytes()),
         (
             "policy_template_id",
             descriptor.policy_template_id.as_bytes(),
@@ -498,6 +500,7 @@ pub mod tests {
             expected_firmware_measurement: [3; 32],
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
+            unlock_mode: "password".to_string(),
             policy_template_id: "kbs-release-policy-v3".to_string(),
             policy_template_sha256: [4; 32],
             platform_release_version: "platform-2026.04".to_string(),
@@ -511,7 +514,7 @@ pub mod tests {
     fn descriptor_core_hash_matches_cap_vector() {
         assert_eq!(
             hex::encode(descriptor_core_hash(&fixed_descriptor())),
-            "4f102fb32b41269d5a22fd0454a3262c335c8b0a83fed9e45e1aac25a7d90b71"
+            "6e1faab9c698a929ceb2a7986a9706f9115f464d0b9238d9b13ddb157b2fc665"
         );
     }
 

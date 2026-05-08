@@ -532,7 +532,7 @@ fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
             },
             "containers": [
                 app_container(descriptor),
-                attestation_proxy_container(descriptor),
+                attestation_proxy_container(descriptor)?,
                 tenant_ingress_container(descriptor),
                 enclava_init_container()?,
             ],
@@ -565,6 +565,14 @@ fn cap_runtime_annotations() -> BTreeMap<&'static str, String> {
 
 fn image_ref(repo: &str, digest: &str) -> String {
     format!("{repo}@{digest}")
+}
+
+fn storage_ownership_mode(unlock_mode: &str) -> Result<&'static str> {
+    match unlock_mode {
+        "auto" | "auto-unlock" => Ok("auto-unlock"),
+        "password" => Ok("password"),
+        other => bail!("descriptor.unlock_mode must be 'auto' or 'password', got '{other}'"),
+    }
 }
 
 fn enclava_init_image() -> Result<String> {
@@ -736,8 +744,8 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
     })
 }
 
-fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Value {
-    json!({
+fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Value> {
+    Ok(json!({
         "name": "attestation-proxy",
         "image": image_ref(ATTESTATION_PROXY_IMAGE_REPO, &descriptor.sidecars.attestation_proxy_digest),
         "command": ["/attestation-proxy"],
@@ -754,7 +762,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Value {
             value_env("ATTESTATION_WORKLOAD_IMAGE", descriptor.image_ref.clone()),
             value_env("ATTESTATION_TLS_PORT", "8443"),
             value_env("TEE_DOMAIN", descriptor.tee_domain.clone()),
-            value_env("STORAGE_OWNERSHIP_MODE", "auto-unlock"),
+            value_env("STORAGE_OWNERSHIP_MODE", storage_ownership_mode(&descriptor.unlock_mode)?),
             value_env("INSTANCE_ID", format!("{}-{}", descriptor.namespace, descriptor.app_name)),
             value_env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
             value_env("OWNER_SEED_HANDOFF_SLOTS", "app-data"),
@@ -772,7 +780,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Value {
         ],
         "securityContext": security_context(65532, 65532, true, false, false, caps(&["ALL"], &[])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
-    })
+    }))
 }
 
 fn tenant_ingress_container(descriptor: &DeploymentDescriptor) -> Value {
@@ -968,6 +976,10 @@ mod tests {
         assert!(invocation.manifest_yaml.contains("value: 10.43.0.1"));
         assert!(invocation
             .manifest_yaml
+            .contains("name: STORAGE_OWNERSHIP_MODE"));
+        assert!(invocation.manifest_yaml.contains("value: password"));
+        assert!(invocation
+            .manifest_yaml
             .contains("image: ghcr.io/enclava-ai/demo@sha256:aaaa"));
         assert!(invocation
             .manifest_yaml
@@ -981,6 +993,23 @@ mod tests {
             .contains("value: /state/tls-state/caddy/config"));
         assert!(invocation.manifest_yaml.contains("- name: A"));
         assert!(invocation.manifest_yaml.contains("value: '1'"));
+    }
+
+    #[test]
+    fn auto_unlock_descriptor_renders_auto_unlock_proxy_mode() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.unlock_mode = "auto".to_string();
+        let manifest = render_pod_manifest(&descriptor).unwrap();
+        assert!(manifest.contains("name: STORAGE_OWNERSHIP_MODE"));
+        assert!(manifest.contains("value: auto-unlock"));
+    }
+
+    #[test]
+    fn invalid_unlock_mode_is_rejected() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.unlock_mode = "manual".to_string();
+        let err = render_pod_manifest(&descriptor).unwrap_err();
+        assert!(err.to_string().contains("descriptor.unlock_mode"));
     }
 
     #[test]

@@ -1,13 +1,13 @@
 {
   "agent_policy_sha256": "a0fdb4fec66e81b11e1294dc662dc3134491d35aed83ce47c740ade3c9bcfcab",
-  "canonical_policy_metadata_hash": "9cd17641395b4b342ff0f43275ef775139890429c23ef293fbec2976223b2f73",
+  "canonical_policy_metadata_hash": "4032fcad7296c8c646d3596eacc0c2a33c25b0f21b68c7d01d81630fc7e0f18e",
   "ed25519_signs": "ce_v1_bytes(records), not ce_v1_hash(records)",
   "encoding": "ce-v1-raw-tlv",
   "metadata": {
     "agent_policy_sha256": "a0fdb4fec66e81b11e1294dc662dc3134491d35aed83ce47c740ade3c9bcfcab",
     "app_id": "22222222-2222-2222-2222-222222222222",
     "deploy_id": "33333333-3333-3333-3333-333333333333",
-    "descriptor_core_hash": "14c63dd863c4fb3726aa4d50ba4d685243c979111756d364bb769f7ec05ffb15",
+    "descriptor_core_hash": "e1c3cf432f64abea088a5009b902af997f3dc891d40f6dba84e1bd62085336a9",
     "descriptor_signing_pubkey": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
     "genpolicy_version_pin": "kata-containers/genpolicy@3.28.0+test",
     "key_id": "policy-test-key-v1",
@@ -19,7 +19,7 @@
   "purpose": "enclava-policy-artifact-v1",
   "rego_sha256": "2150f156c5a2d98e0d584a3f649aafed0bceca63483de7ac87d2729fce1cbf8d",
   "service_signing_seed_b64": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
-  "signature": "a2c4ff4d0b6d3e22de69fccef225f7f569e744a88a3f3e0c2f3505b91516c96c04b7226b745cc9a0bd077a8f7ec1e4e8e3a3241ce45b51ea6290796536dfdc09",
-  "signing_input_hex": "0007707572706f73650000001a656e636c6176612d706f6c6963792d61727469666163742d763100086d65746164617461000000209cd17641395b4b342ff0f43275ef775139890429c23ef293fbec2976223b2f73000b7265676f5f736861323536000000202150f156c5a2d98e0d584a3f649aafed0bceca63483de7ac87d2729fce1cbf8d",
+  "signature": "83fcd651993b9f4bed5eee13a83e7342fd84bdf7125b012b7cda07933852e110f8989b6f0c6fb5f1f05c77861c6614fa94d9fe36d642ebfe21dad39c77aa190e",
+  "signing_input_hex": "0007707572706f73650000001a656e636c6176612d706f6c6963792d61727469666163742d763100086d65746164617461000000204032fcad7296c8c646d3596eacc0c2a33c25b0f21b68c7d01d81630fc7e0f18e000b7265676f5f736861323536000000202150f156c5a2d98e0d584a3f649aafed0bceca63483de7ac87d2729fce1cbf8d",
   "verify_pubkey_b64": "F8t5+ytBIPKx7GXkGY1uCLKOgT/rAeSkAIObheGAgM4="
 }
