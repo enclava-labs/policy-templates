@@ -20,7 +20,7 @@ const KATA_RUNTIME_HANDLER: &str = "kata-qemu-snp";
 const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-ai/attestation-proxy";
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-ai/caddy-ingress";
-const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
+const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
@@ -1129,6 +1129,9 @@ mod tests {
             .manifest_yaml
             .contains("image: ghcr.io/enclava-ai/demo@sha256:aaaa"));
         assert!(invocation
+            .manifest_yaml
+            .contains("- /enclava-tools/enclava-wait-exec"));
+        assert!(!invocation
             .manifest_yaml
             .contains("- /usr/local/bin/enclava-wait-exec"));
         assert!(invocation.manifest_yaml.contains("$(privileged_caps)"));
