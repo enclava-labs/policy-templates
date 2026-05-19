@@ -837,6 +837,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             mount("ownership-signal", "/run/ownership-signal", false),
             mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
             mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
+            mount("unlock-socket", "/run/enclava", true),
             mount("unlock-channel", "/run/enclava-unlock", false),
         ],
         "securityContext": security_context(10001, 10001, true, false, false, caps(&["ALL"], &[])),
@@ -1179,6 +1180,18 @@ mod tests {
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
         assert!(manifest.contains("value: /state/.enclava/config"));
         assert!(manifest.contains("mountPath: /state"));
+        let mounts = container
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .unwrap();
+        let ready_mount = mounts
+            .iter()
+            .find(|mount| {
+                mount.pointer("/name") == Some(&json!("unlock-socket"))
+                    && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
+            })
+            .expect("attestation-proxy can read enclava-init readiness file");
+        assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(true)));
     }
 
     #[test]
