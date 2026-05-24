@@ -842,7 +842,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             mount("unlock-socket", "/run/enclava", true),
             mount("unlock-channel", "/run/enclava-unlock", false),
         ],
-        "securityContext": security_context(10001, 10001, true, false, false, caps(&["ALL"], &[])),
+        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["MKNOD"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
     }))
 }
@@ -1215,19 +1215,27 @@ mod tests {
     }
 
     #[test]
-    fn attestation_proxy_runs_as_state_owner_for_config_storage() {
+    fn attestation_proxy_can_create_sev_guest_device_for_auto_unlock() {
         let container = attestation_proxy_container(&fixed_descriptor()).unwrap();
         assert_eq!(
             container.pointer("/securityContext/runAsUser"),
-            Some(&json!(10001))
+            Some(&json!(0))
         );
         assert_eq!(
             container.pointer("/securityContext/runAsGroup"),
-            Some(&json!(10001))
+            Some(&json!(0))
         );
         assert_eq!(
             container.pointer("/securityContext/readOnlyRootFilesystem"),
             Some(&json!(true))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/add/0"),
+            Some(&json!("MKNOD"))
         );
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
