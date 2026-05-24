@@ -903,11 +903,13 @@ fn enclava_tools_container() -> Result<Value> {
         "image": enclava_init_image()?,
         "command": [
             "/bin/sh",
+            "-eu",
             "-c",
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec",
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers",
         ],
         "volumeMounts": [
             mount("enclava-tools", "/work", false),
+            mount("unlock-socket", "/run/enclava", false),
         ],
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &[])),
         "resources": resources("10m", "16Mi", "50m", "64Mi"),
@@ -1106,7 +1108,12 @@ mod tests {
         assert!(invocation
             .manifest_yaml
             .contains("cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec"));
+        assert!(invocation.manifest_yaml.contains("- -eu"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
         assert!(invocation.manifest_yaml.contains("mountPath: /work"));
+        assert!(invocation.manifest_yaml.contains("mountPath: /run/enclava"));
         assert!(invocation.manifest_yaml.contains("name: unlock-channel"));
         assert!(invocation
             .manifest_yaml
@@ -1171,10 +1178,28 @@ mod tests {
             .pointer("/spec/initContainers")
             .and_then(Value::as_array)
             .expect("CAP genpolicy manifest must include initContainers");
-        assert!(init_containers.iter().any(|container| {
-            container.pointer("/name") == Some(&json!("enclava-tools"))
-                && container.pointer("/securityContext/readOnlyRootFilesystem")
-                    == Some(&json!(true))
+        let enclava_tools = init_containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("enclava-tools")))
+            .expect("enclava-tools init container is present");
+        assert_eq!(
+            enclava_tools.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&json!(true))
+        );
+        assert_eq!(enclava_tools.pointer("/command/1"), Some(&json!("-eu")));
+        assert!(enclava_tools
+            .pointer("/command/3")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+        let tool_mounts = enclava_tools
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .expect("enclava-tools volumeMounts are present");
+        assert!(tool_mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("unlock-socket"))
+                && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
+                && mount.pointer("/readOnly") == Some(&json!(false))
         }));
 
         let app_containers = manifest
