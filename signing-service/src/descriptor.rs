@@ -471,7 +471,7 @@ pub mod tests {
             namespace: "cap-abcd1234-demo".to_string(),
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [9; 32],
-            image_ref: "ghcr.io/enclava-ai/demo@sha256:aaaa".to_string(),
+            image_ref: "ghcr.io/enclava-labs/demo@sha256:aaaa".to_string(),
             image_digest: "sha256:aaaa".to_string(),
             signer_identity: SignerIdentity {
                 subject: "https://github.com/x/y/.github/workflows/build.yml".to_string(),
@@ -521,7 +521,7 @@ pub mod tests {
     fn descriptor_core_hash_matches_cap_vector() {
         assert_eq!(
             hex::encode(descriptor_core_hash(&fixed_descriptor())),
-            "9c9e02f64492caed0c44990b09bfb967ba85f40ec9ec31276a3e260a8a064364"
+            "1e1758ef9f3235eba697bb71672e69ca27f353ebffa94e7d186f33ebd39932de"
         );
     }
 
@@ -533,7 +533,7 @@ pub mod tests {
         let image_ref_position = json.find("\"image_ref\"").unwrap();
         let image_digest_position = json.find("\"image_digest\"").unwrap();
 
-        assert_eq!(object["image_ref"], "ghcr.io/enclava-ai/demo@sha256:aaaa");
+        assert_eq!(object["image_ref"], "ghcr.io/enclava-labs/demo@sha256:aaaa");
         assert_eq!(object["image_digest"], "sha256:aaaa");
         assert!(
             image_ref_position < image_digest_position,

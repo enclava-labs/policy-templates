@@ -38,7 +38,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/enclava-ai/policy-signing-service
+          images: ghcr.io/enclava-labs/policy-signing-service
           tags: |
             type=ref,event=branch
             type=sha,prefix=
@@ -61,7 +61,7 @@ jobs:
       - name: Sign pushed digest
         if: github.event_name != 'pull_request'
         env:
-          IMAGE: ghcr.io/enclava-ai/policy-signing-service
+          IMAGE: ghcr.io/enclava-labs/policy-signing-service
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           for attempt in 1 2 3; do
