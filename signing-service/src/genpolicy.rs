@@ -829,6 +829,8 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
         value_env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
+        value_env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"),
+        value_env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
         value_env(
             "ENCLAVA_INIT_UNLOCK_SOCKET",
             "/run/enclava-unlock/unlock.sock",
@@ -851,7 +853,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             mount("ownership-signal", "/run/ownership-signal", false),
             mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
             mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
-            mount("unlock-socket", "/run/enclava", true),
+            mount("unlock-socket", "/run/enclava", false),
             mount("unlock-channel", "/run/enclava-unlock", false),
         ],
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["MKNOD"])),
@@ -948,7 +950,10 @@ fn enclava_init_container() -> Result<Value> {
             value_env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             value_env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
             value_env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
-            value_env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "web,tenant-ingress"),
+            value_env(
+                "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
+                "web,tenant-ingress,attestation-proxy",
+            ),
         ]),
         "volumeMounts": [
             mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
@@ -1287,7 +1292,69 @@ mod tests {
                     && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
             })
             .expect("attestation-proxy can read enclava-init readiness file");
-        assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(true)));
+        assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn attestation_proxy_registers_startup_sentinel_for_luks_binding() {
+        let container = attestation_proxy_container(&fixed_descriptor()).unwrap();
+        let env = container
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("attestation-proxy env is present");
+        let env_value = |name: &str| {
+            env.iter()
+                .find(|item| item.pointer("/name") == Some(&json!(name)))
+                .and_then(|item| item.pointer("/value"))
+                .and_then(Value::as_str)
+        };
+
+        assert_eq!(
+            env_value("ENCLAVA_CONTAINER_NAME"),
+            Some("attestation-proxy")
+        );
+        assert_eq!(
+            env_value("ENCLAVA_STARTED_DIR"),
+            Some("/run/enclava/containers")
+        );
+
+        let mounts = container
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .expect("attestation-proxy volumeMounts are present");
+        let run_enclava = mounts
+            .iter()
+            .find(|mount| {
+                mount.pointer("/name") == Some(&json!("unlock-socket"))
+                    && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
+            })
+            .expect("attestation-proxy mounts /run/enclava");
+        assert_eq!(run_enclava.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn enclava_init_waits_for_attestation_proxy_startup_sentinel() {
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
+        let containers = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .expect("pod containers are present");
+        let enclava_init = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("enclava-init")))
+            .expect("enclava-init container is present");
+        let env = enclava_init
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("enclava-init env is present");
+        let wait_for = env
+            .iter()
+            .find(|item| item.pointer("/name") == Some(&json!("ENCLAVA_INIT_WAIT_FOR_CONTAINERS")))
+            .and_then(|item| item.pointer("/value"))
+            .and_then(Value::as_str);
+
+        assert_eq!(wait_for, Some("web,tenant-ingress,attestation-proxy"));
     }
 
     #[test]
