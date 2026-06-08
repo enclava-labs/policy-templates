@@ -856,7 +856,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             mount("unlock-socket", "/run/enclava", false),
             mount("unlock-channel", "/run/enclava-unlock", false),
         ],
-        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["MKNOD"])),
+        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["MKNOD", "SYS_PTRACE"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
     }))
 }
@@ -1274,6 +1274,10 @@ mod tests {
         assert_eq!(
             container.pointer("/securityContext/capabilities/add/0"),
             Some(&json!("MKNOD"))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/add/1"),
+            Some(&json!("SYS_PTRACE"))
         );
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
