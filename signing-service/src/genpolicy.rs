@@ -806,11 +806,8 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         ));
     }
     env_vars.extend([
-        value_env("CAP_CONFIG_DIR", "/state/app-data/.enclava/config"),
-        value_env(
-            "CAP_CONFIG_READY_MARKER",
-            "/state/app-data/.enclava/luks-ready",
-        ),
+        value_env("CAP_CONFIG_DIR", "/state/.enclava/config"),
+        value_env("CAP_CONFIG_READY_MARKER", "/state/.enclava/luks-ready"),
         value_env("CAP_CONFIG_FILE_GID", "10001"),
         value_env(
             "STORAGE_OWNERSHIP_MODE",
@@ -1286,9 +1283,9 @@ mod tests {
         );
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
-        assert!(manifest.contains("value: /state/app-data/.enclava/config"));
+        assert!(manifest.contains("value: /state/.enclava/config"));
         assert!(manifest.contains("name: CAP_CONFIG_READY_MARKER"));
-        assert!(manifest.contains("value: /state/app-data/.enclava/luks-ready"));
+        assert!(manifest.contains("value: /state/.enclava/luks-ready"));
         assert!(manifest.contains("name: CAP_CONFIG_FILE_GID"));
         assert!(manifest.contains("value: '10001'"));
         assert!(manifest.contains("mountPath: /state"));
