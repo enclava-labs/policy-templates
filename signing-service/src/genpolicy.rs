@@ -382,6 +382,7 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     let normalized = normalize_cap_storage_mounts(&normalized);
     let normalized = normalize_cap_sandbox_storages(&normalized);
     let normalized = normalize_cap_extra_storages(&normalized);
+    let normalized = normalize_cap_oci_version(&normalized);
     normalize_privileged_caps_placeholder(&normalized)
 }
 
@@ -585,6 +586,28 @@ allow_cap_extra_storage(i_storage, bundle_id, _sandbox_id) if {
 
     let normalized = policy_text.replace(STORAGE_COUNT_CHECK, STORAGE_COUNT_ALLOW);
     insert_policy_helper(&normalized, EXTRA_STORAGE_HELPERS)
+}
+
+fn normalize_cap_oci_version(policy_text: &str) -> String {
+    const OCI_VERSION_CHECK: &str = "    p_oci.Version == i_oci.Version\n";
+    const OCI_VERSION_ALLOW: &str = "    allow_cap_oci_version(p_oci.Version, i_oci.Version)\n";
+    const OCI_VERSION_HELPERS: &str = r#"
+allow_cap_oci_version(policy_version, input_version) if {
+    policy_version == input_version
+}
+
+allow_cap_oci_version(policy_version, input_version) if {
+    policy_version == "1.1.0"
+    input_version == "1.3.0"
+}
+"#;
+
+    if policy_text.contains("allow_cap_oci_version") || !policy_text.contains(OCI_VERSION_CHECK) {
+        return policy_text.to_string();
+    }
+
+    let normalized = policy_text.replace(OCI_VERSION_CHECK, OCI_VERSION_ALLOW);
+    insert_policy_helper(&normalized, OCI_VERSION_HELPERS)
 }
 
 fn insert_policy_helper(policy_text: &str, helper: &str) -> String {
@@ -1686,6 +1709,26 @@ allow_create_container_input(p_container) if {
 
         assert!(normalized.contains("\"$(privileged_caps)\""));
         assert!(!normalized.contains("CAP_$(privileged_caps)"));
+    }
+
+    #[test]
+    fn allows_kata_oci_version_minor_drift() {
+        let policy = r#"default AllowRequestsFailingPolicy := false
+
+allow_create_container_input(p_container) if {
+    p_oci := p_container.OCI
+    print("CreateContainerRequest: p Version =", p_oci.Version, "i Version =", i_oci.Version)
+    p_oci.Version == i_oci.Version
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(normalized.contains("allow_cap_oci_version(p_oci.Version, i_oci.Version)"));
+        assert!(normalized.contains("policy_version == input_version"));
+        assert!(normalized.contains("policy_version == \"1.1.0\""));
+        assert!(normalized.contains("input_version == \"1.3.0\""));
+        assert!(!normalized.contains("p_oci.Version == i_oci.Version"));
     }
 
     #[test]
