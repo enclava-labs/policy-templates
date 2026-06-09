@@ -24,11 +24,67 @@ const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
+const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
+const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
+
+fn tenant_caddy_tls_mode() -> String {
+    std::env::var("TENANT_CADDY_TLS_MODE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "acme".to_string())
+}
 
 fn tenant_caddy_internal_tls_enabled() -> bool {
-    std::env::var("TENANT_CADDY_TLS_MODE")
-        .map(|value| value.eq_ignore_ascii_case("internal"))
-        .unwrap_or(false)
+    tenant_caddy_tls_mode() == "internal"
+}
+
+fn tenant_caddy_dns01_broker_enabled() -> bool {
+    tenant_caddy_tls_mode() == "dns01-broker"
+}
+
+fn shell_escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = arg.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn caddy_supervisor_script(dns01_broker: bool) -> String {
+    let mut script = String::new();
+    script.push_str("trap 'exit 0' TERM INT\n");
+    if dns01_broker {
+        script.push_str("i=0\n");
+        script.push_str("while [ \"$i\" -lt 300 ]; do\n");
+        script.push_str(&format!(
+            "  if [ -r {} ] && [ -r {} ]; then break; fi\n",
+            shell_escape_arg(CADDY_BROKER_CERT_PATH),
+            shell_escape_arg(CADDY_BROKER_KEY_PATH)
+        ));
+        script.push_str(
+            "  if [ \"$i\" = 0 ] || [ $((i % 10)) -eq 0 ]; then echo 'tenant-ingress waiting for TLS certificate handoff' >&2; fi\n",
+        );
+        script.push_str("  i=$((i + 1))\n");
+        script.push_str("  sleep 1\n");
+        script.push_str("done\n");
+        script.push_str(&format!(
+            "if [ ! -r {} ] || [ ! -r {} ]; then echo 'tenant-ingress TLS certificate handoff missing or unreadable' >&2; exit 1; fi\n",
+            shell_escape_arg(CADDY_BROKER_CERT_PATH),
+            shell_escape_arg(CADDY_BROKER_KEY_PATH)
+        ));
+    }
+    script.push_str("while true; do\n");
+    script.push_str("  rc=0\n");
+    script.push_str("  if /usr/bin/caddy validate --config /etc/caddy/Caddyfile; then\n");
+    script.push_str("    /usr/bin/caddy run --config /etc/caddy/Caddyfile || rc=$?\n");
+    script.push_str("  else\n");
+    script.push_str("    rc=$?\n");
+    script.push_str("  fi\n");
+    script.push_str("  echo \"tenant-ingress caddy exited rc=$rc; restarting in 5s\" >&2\n");
+    script.push_str("  sleep 5\n");
+    script.push_str("done");
+    script
 }
 
 fn trustee_kbs_url() -> String {
@@ -886,7 +942,7 @@ fn tenant_ingress_container_for_mode(
         "name": "tenant-ingress",
         "image": image_ref(&caddy_ingress_image_repo(), &descriptor.sidecars.caddy_digest),
         "command": [ENCLAVA_WAIT_EXEC_PATH],
-        "args": ["/usr/bin/caddy", "run", "--config", "/etc/caddy/Caddyfile"],
+        "args": ["/bin/sh", "-ec", caddy_supervisor_script(tenant_caddy_dns01_broker_enabled())],
         "ports": [
             {"containerPort": tls_port, "name": "https"},
         ],
@@ -1186,6 +1242,38 @@ mod tests {
         assert!(yaml.contains("name: XDG_CONFIG_HOME"));
         assert!(yaml.contains("value: /run/enclava/caddy-runtime/config"));
         assert!(yaml.contains("name: HOME"));
+    }
+
+    #[test]
+    fn tenant_ingress_supervises_caddy_inside_existing_kata_container() {
+        let container = tenant_ingress_container_for_mode(&fixed_descriptor(), false);
+        assert_eq!(
+            container.pointer("/command/0"),
+            Some(&json!(ENCLAVA_WAIT_EXEC_PATH))
+        );
+        assert_eq!(container.pointer("/args/0"), Some(&json!("/bin/sh")));
+        assert_eq!(container.pointer("/args/1"), Some(&json!("-ec")));
+        let script = container
+            .pointer("/args/2")
+            .and_then(Value::as_str)
+            .expect("tenant-ingress supervisor script");
+        assert!(script.contains("while true; do"));
+        assert!(script.contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"));
+        assert!(script.contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
+        assert!(script.contains("tenant-ingress caddy exited rc=$rc; restarting in 5s"));
+    }
+
+    #[test]
+    fn dns01_broker_supervisor_waits_for_tls_handoff() {
+        let script = caddy_supervisor_script(true);
+        assert!(script.contains("tenant-ingress waiting for TLS certificate handoff"));
+        assert!(script.contains(CADDY_BROKER_CERT_PATH));
+        assert!(script.contains(CADDY_BROKER_KEY_PATH));
+
+        let non_broker_script = caddy_supervisor_script(false);
+        assert!(!non_broker_script.contains("TLS certificate handoff"));
+        assert!(!non_broker_script.contains(CADDY_BROKER_CERT_PATH));
+        assert!(!non_broker_script.contains(CADDY_BROKER_KEY_PATH));
     }
 
     #[test]
