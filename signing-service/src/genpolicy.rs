@@ -26,6 +26,8 @@ const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
 const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
+const ATTESTATION_EXPECTED_INIT_DATA_HASH_ENV_REGEX: &str =
+    "^ATTESTATION_EXPECTED_INIT_DATA_HASH=[0-9a-f]{64}$";
 
 fn tenant_caddy_tls_mode() -> String {
     std::env::var("TENANT_CADDY_TLS_MODE")
@@ -254,6 +256,7 @@ fn prepare_cap_settings_dir(source_dir: &Path, work_dir: &Path) -> Result<PathBu
     let mut settings: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parsing {}", settings_path.display()))?;
     remove_service_account_token_mounts(&mut settings);
+    allow_attestation_expected_init_data_hash_env(&mut settings);
     let rendered =
         serde_json::to_vec_pretty(&settings).context("serializing CAP genpolicy settings")?;
     fs::write(dest_dir.join("genpolicy-settings.json"), rendered)
@@ -315,6 +318,50 @@ fn remove_service_account_token_mounts(settings: &mut Value) {
                 .as_str()
                 .is_some_and(|destination| TOKEN_MOUNT_DESTINATIONS.contains(&destination))
         });
+    }
+}
+
+fn allow_attestation_expected_init_data_hash_env(settings: &mut Value) {
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let settings = settings.as_object_mut().expect("settings is an object");
+
+    let request_defaults = settings
+        .entry("request_defaults")
+        .or_insert_with(|| json!({}));
+    if !request_defaults.is_object() {
+        *request_defaults = json!({});
+    }
+    let request_defaults = request_defaults
+        .as_object_mut()
+        .expect("request_defaults is an object");
+
+    let create_container = request_defaults
+        .entry("CreateContainerRequest")
+        .or_insert_with(|| json!({}));
+    if !create_container.is_object() {
+        *create_container = json!({});
+    }
+    let create_container = create_container
+        .as_object_mut()
+        .expect("CreateContainerRequest is an object");
+
+    let allow_env_regex = create_container
+        .entry("allow_env_regex")
+        .or_insert_with(|| json!([]));
+    if !allow_env_regex.is_array() {
+        *allow_env_regex = json!([]);
+    }
+    let allow_env_regex = allow_env_regex
+        .as_array_mut()
+        .expect("allow_env_regex is an array");
+
+    if !allow_env_regex
+        .iter()
+        .any(|entry| entry == ATTESTATION_EXPECTED_INIT_DATA_HASH_ENV_REGEX)
+    {
+        allow_env_regex.push(json!(ATTESTATION_EXPECTED_INIT_DATA_HASH_ENV_REGEX));
     }
 }
 
@@ -1556,6 +1603,42 @@ mod tests {
         assert_eq!(mounts[0]["destination"], "/etc/hosts");
         let destinations = settings["mount_destinations"].as_array().unwrap();
         assert_eq!(destinations, &[json!("/etc/hosts")]);
+    }
+
+    #[test]
+    fn adds_attestation_expected_init_data_hash_regex_to_settings() {
+        let mut settings = json!({
+            "request_defaults": {
+                "CreateContainerRequest": {
+                    "allow_env_regex": ["^HOSTNAME=$(dns_label)$"]
+                }
+            }
+        });
+
+        allow_attestation_expected_init_data_hash_env(&mut settings);
+        allow_attestation_expected_init_data_hash_env(&mut settings);
+
+        let regexes = settings
+            .pointer("/request_defaults/CreateContainerRequest/allow_env_regex")
+            .and_then(Value::as_array)
+            .unwrap();
+        let expected = "^ATTESTATION_EXPECTED_INIT_DATA_HASH=[0-9a-f]{64}$";
+        assert_eq!(
+            regexes
+                .iter()
+                .filter(|entry| **entry == json!(expected))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn policy_manifest_omits_self_referential_attestation_init_hash_env() {
+        let manifest =
+            serde_yaml::to_string(&attestation_proxy_container(&fixed_descriptor()).unwrap())
+                .unwrap();
+
+        assert!(!manifest.contains("name: ATTESTATION_EXPECTED_INIT_DATA_HASH"));
     }
 
     #[test]
