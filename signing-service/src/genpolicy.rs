@@ -772,6 +772,59 @@ fn value_env(name: &str, value: impl Into<String>) -> Value {
     json!({"name": name, "value": value.into()})
 }
 
+fn required_config_keys(descriptor: &DeploymentDescriptor) -> Option<String> {
+    if let Some(value) = descriptor
+        .oci_runtime_spec
+        .env
+        .iter()
+        .find(|env| env.name == "ENCLAVA_REQUIRED_CONFIG_KEYS")
+        .map(|env| env.value.as_str())
+    {
+        if let Some(keys) = normalize_required_config_keys(value) {
+            return Some(keys);
+        }
+    }
+
+    descriptor
+        .oci_runtime_spec
+        .args
+        .iter()
+        .find_map(|arg| required_config_keys_from_arg(arg))
+}
+
+fn required_config_keys_from_arg(arg: &str) -> Option<String> {
+    const PREFIX: &str = "ENCLAVA_REQUIRED_CONFIG_KEYS=";
+    let value = arg.split_once(PREFIX)?.1;
+    let value = value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .trim_matches('\'');
+    normalize_required_config_keys(value)
+}
+
+fn normalize_required_config_keys(value: &str) -> Option<String> {
+    let keys = value
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.iter().any(|key| !is_valid_config_key(key)) {
+        return None;
+    }
+    Some(keys.join(","))
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn field_env(name: &str, field_path: &str) -> Value {
     json!({
         "name": name,
@@ -965,6 +1018,9 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     ]);
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
         env_vars.push(value_env("KBS_RESOURCE_CA_CERT_PEM", cert));
+    }
+    if let Some(keys) = required_config_keys(descriptor) {
+        env_vars.push(value_env("CAP_CONFIG_REQUIRED_KEYS", keys));
     }
 
     Ok(json!({
@@ -1499,6 +1555,29 @@ mod tests {
             })
             .expect("attestation-proxy mounts /run/enclava");
         assert_eq!(run_enclava.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn attestation_proxy_receives_workload_required_config_keys() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "ENCLAVA_REQUIRED_CONFIG_KEYS=ADMIN_EMAIL,ADMIN_PASSWORD exec /app".to_string(),
+        ];
+
+        let container = attestation_proxy_container(&descriptor).unwrap();
+        let env = container
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("attestation-proxy env is present");
+        let value = env
+            .iter()
+            .find(|item| item.pointer("/name") == Some(&json!("CAP_CONFIG_REQUIRED_KEYS")))
+            .and_then(|item| item.pointer("/value"))
+            .and_then(Value::as_str);
+
+        assert_eq!(value, Some("ADMIN_EMAIL,ADMIN_PASSWORD"));
     }
 
     #[test]
