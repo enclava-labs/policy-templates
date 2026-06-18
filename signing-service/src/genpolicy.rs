@@ -1191,6 +1191,9 @@ fn enclava_init_container() -> Result<Value> {
                 "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
                 "web,tenant-ingress,attestation-proxy",
             ),
+            value_env("KBS_FETCH_RETRIES", "120"),
+            value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
         ]),
         "volumeMounts": [
             mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
@@ -1660,6 +1663,34 @@ mod tests {
             .and_then(Value::as_str);
 
         assert_eq!(wait_for, Some("web,tenant-ingress,attestation-proxy"));
+    }
+
+    #[test]
+    fn enclava_init_policy_manifest_includes_kbs_fetch_retry_env() {
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
+        let containers = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .expect("pod containers are present");
+        let enclava_init = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("enclava-init")))
+            .expect("enclava-init container is present");
+        let env = enclava_init
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("enclava-init env is present");
+        let env_value = |name: &str| {
+            env.iter()
+                .find(|item| item.pointer("/name") == Some(&json!(name)))
+                .and_then(|item| item.pointer("/value"))
+                .and_then(Value::as_str)
+        };
+
+        assert_eq!(env_value("KBS_FETCH_RETRIES"), Some("120"));
+        assert_eq!(env_value("KBS_FETCH_RETRY_SLEEP_SECONDS"), Some("2"));
+        assert_eq!(env_value("KBS_FETCH_REQUEST_TIMEOUT_SECONDS"), Some("10"));
     }
 
     #[test]
