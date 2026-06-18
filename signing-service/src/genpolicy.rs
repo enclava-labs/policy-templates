@@ -430,6 +430,7 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     let normalized = normalize_cap_sandbox_storages(&normalized);
     let normalized = normalize_cap_extra_storages(&normalized);
     let normalized = normalize_cap_oci_version(&normalized);
+    let normalized = normalize_cap_container_annotations(&normalized);
     normalize_privileged_caps_placeholder(&normalized)
 }
 
@@ -655,6 +656,35 @@ allow_cap_oci_version(policy_version, input_version) if {
 
     let normalized = policy_text.replace(OCI_VERSION_CHECK, OCI_VERSION_ALLOW);
     insert_policy_helper(&normalized, OCI_VERSION_HELPERS)
+}
+
+fn normalize_cap_container_annotations(policy_text: &str) -> String {
+    const CONTAINER_ANNOTATION_CHECK: &str = r#"    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
+    p_value == i_value
+"#;
+    const CONTAINER_ANNOTATION_ALLOW: &str = r#"    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
+    allow_cap_container_annotation(key, p_value, i_value)
+"#;
+    const CONTAINER_ANNOTATION_HELPERS: &str = r#"
+allow_cap_container_annotation(_key, p_value, i_value) if {
+    p_value == i_value
+}
+
+allow_cap_container_annotation(key, p_value, i_value) if {
+    key == "io.kubernetes.cri.container-name"
+    p_value == "enclava-init"
+    i_value == "enclava-tools"
+}
+"#;
+
+    if policy_text.contains("allow_cap_container_annotation")
+        || !policy_text.contains(CONTAINER_ANNOTATION_CHECK)
+    {
+        return policy_text.to_string();
+    }
+
+    let normalized = policy_text.replace(CONTAINER_ANNOTATION_CHECK, CONTAINER_ANNOTATION_ALLOW);
+    insert_policy_helper(&normalized, CONTAINER_ANNOTATION_HELPERS)
 }
 
 fn insert_policy_helper(policy_text: &str, helper: &str) -> String {
@@ -1874,6 +1904,29 @@ allow_create_container_input(p_container) if {
 
         assert!(normalized.contains("\"$(privileged_caps)\""));
         assert!(!normalized.contains("CAP_$(privileged_caps)"));
+    }
+
+    #[test]
+    fn allows_enclava_tools_name_for_init_helper_policy_entry() {
+        let policy = r#"default AllowRequestsFailingPolicy := false
+
+allow_container_annotation(key, p_value, i_value) if {
+    print("allow_container_annotation: key =", key)
+    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
+    p_value == i_value
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(normalized.contains("allow_cap_container_annotation(key, p_value, i_value)"));
+        assert!(normalized.contains("key == \"io.kubernetes.cri.container-name\""));
+        assert!(normalized.contains("p_value == \"enclava-init\""));
+        assert!(normalized.contains("i_value == \"enclava-tools\""));
+        assert!(!normalized.contains(
+            r#"print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
+    p_value == i_value"#
+        ));
     }
 
     #[test]
