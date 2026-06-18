@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::descriptor::{DeploymentDescriptor, EnvVar, Resources};
+use crate::descriptor::{DeploymentDescriptor, EnvVar, Mount, Resources};
 
 const KATA_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
 const KATA_KERNEL_PARAMS_ANNOTATION: &str = "io.katacontainers.config.hypervisor.kernel_params";
@@ -28,6 +28,10 @@ const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tl
 const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 const ATTESTATION_EXPECTED_INIT_DATA_HASH_ENV_REGEX: &str =
     "^ATTESTATION_EXPECTED_INIT_DATA_HASH=[0-9a-f]{64}$";
+const STATE_CAP_CONFIG_DIR: &str = "/state/.enclava/config";
+const STATE_CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
+const APP_DATA_CAP_CONFIG_DIR: &str = "/state/app-data/.enclava/config";
+const APP_DATA_CAP_CONFIG_READY_MARKER: &str = "/state/app-data/.enclava/luks-ready";
 
 fn tenant_caddy_tls_mode() -> String {
     std::env::var("TENANT_CADDY_TLS_MODE")
@@ -826,6 +830,35 @@ fn value_env(name: &str, value: impl Into<String>) -> Value {
     json!({"name": name, "value": value.into()})
 }
 
+fn cap_config_paths(descriptor: &DeploymentDescriptor) -> (&'static str, &'static str) {
+    if descriptor
+        .oci_runtime_spec
+        .mounts
+        .iter()
+        .any(mount_uses_app_data_slot)
+    {
+        (APP_DATA_CAP_CONFIG_DIR, APP_DATA_CAP_CONFIG_READY_MARKER)
+    } else {
+        (STATE_CAP_CONFIG_DIR, STATE_CAP_CONFIG_READY_MARKER)
+    }
+}
+
+fn mount_uses_app_data_slot(mount: &Mount) -> bool {
+    if mount.source.strip_prefix("state-mount:") == Some("app-data") {
+        return true;
+    }
+    if mount.mount_type != "kubernetes-volume-subpath" && !mount.source.starts_with("state-mount:")
+    {
+        return false;
+    }
+    storage_subdir(&mount.destination) == "app-data"
+}
+
+fn storage_subdir(path: &str) -> String {
+    let rel = path.trim_start_matches('/');
+    rel.strip_prefix("state/").unwrap_or(rel).replace('/', "-")
+}
+
 fn required_config_keys(descriptor: &DeploymentDescriptor) -> Option<String> {
     if let Some(value) = descriptor
         .oci_runtime_spec
@@ -1020,6 +1053,7 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
 }
 
 fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Value> {
+    let (cap_config_dir, cap_config_ready_marker) = cap_config_paths(descriptor);
     let mut env_vars = vec![
         value_env("ATTESTATION_WORKLOAD_CONTAINER", "web"),
         field_env("ATTESTATION_POD_NAME", "metadata.name"),
@@ -1039,11 +1073,8 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         ));
     }
     env_vars.extend([
-        value_env("CAP_CONFIG_DIR", "/state/app-data/.enclava/config"),
-        value_env(
-            "CAP_CONFIG_READY_MARKER",
-            "/state/app-data/.enclava/luks-ready",
-        ),
+        value_env("CAP_CONFIG_DIR", cap_config_dir),
+        value_env("CAP_CONFIG_READY_MARKER", cap_config_ready_marker),
         value_env("CAP_CONFIG_FILE_GID", "10001"),
         value_env(
             "STORAGE_OWNERSHIP_MODE",
@@ -1560,9 +1591,9 @@ mod tests {
         );
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
-        assert!(manifest.contains("value: /state/app-data/.enclava/config"));
+        assert!(manifest.contains("value: /state/.enclava/config"));
         assert!(manifest.contains("name: CAP_CONFIG_READY_MARKER"));
-        assert!(manifest.contains("value: /state/app-data/.enclava/luks-ready"));
+        assert!(manifest.contains("value: /state/.enclava/luks-ready"));
         assert!(manifest.contains("name: CAP_CONFIG_FILE_GID"));
         assert!(manifest.contains("value: '10001'"));
         assert!(manifest.contains("mountPath: /state"));
@@ -1578,6 +1609,25 @@ mod tests {
             })
             .expect("attestation-proxy can read enclava-init readiness file");
         assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn attestation_proxy_uses_app_data_config_storage_for_app_data_mounts() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.mounts = vec![Mount {
+            source: "state-mount:app-data".to_string(),
+            destination: "/state/app-data".to_string(),
+            mount_type: "kubernetes-volume-subpath".to_string(),
+            options: vec!["rw".to_string()],
+        }];
+
+        let container = attestation_proxy_container(&descriptor).unwrap();
+        let manifest = serde_yaml::to_string(&container).unwrap();
+
+        assert!(manifest.contains("name: CAP_CONFIG_DIR"));
+        assert!(manifest.contains("value: /state/app-data/.enclava/config"));
+        assert!(manifest.contains("name: CAP_CONFIG_READY_MARKER"));
+        assert!(manifest.contains("value: /state/app-data/.enclava/luks-ready"));
     }
 
     #[test]
