@@ -659,12 +659,6 @@ allow_cap_oci_version(policy_version, input_version) if {
 }
 
 fn normalize_cap_container_annotations(policy_text: &str) -> String {
-    const CONTAINER_ANNOTATION_CHECK: &str = r#"    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
-    p_value == i_value
-"#;
-    const CONTAINER_ANNOTATION_ALLOW: &str = r#"    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
-    allow_cap_container_annotation(key, p_value, i_value)
-"#;
     const CONTAINER_ANNOTATION_HELPERS: &str = r#"
 allow_cap_container_annotation(_key, p_value, i_value) if {
     p_value == i_value
@@ -677,14 +671,44 @@ allow_cap_container_annotation(key, p_value, i_value) if {
 }
 "#;
 
-    if policy_text.contains("allow_cap_container_annotation")
-        || !policy_text.contains(CONTAINER_ANNOTATION_CHECK)
-    {
+    if policy_text.contains("allow_cap_container_annotation") {
         return policy_text.to_string();
     }
 
-    let normalized = policy_text.replace(CONTAINER_ANNOTATION_CHECK, CONTAINER_ANNOTATION_ALLOW);
-    insert_policy_helper(&normalized, CONTAINER_ANNOTATION_HELPERS)
+    let mut in_annotation_block = false;
+    let mut replaced = false;
+    let lines = policy_text
+        .split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("allow_container_annotation(") && trimmed.ends_with("if {") {
+                in_annotation_block = true;
+                return line.to_string();
+            }
+
+            let line = if in_annotation_block && trimmed == "p_value == i_value" {
+                replaced = true;
+                line.replacen(
+                    "p_value == i_value",
+                    "allow_cap_container_annotation(key, p_value, i_value)",
+                    1,
+                )
+            } else {
+                line.to_string()
+            };
+
+            if in_annotation_block && trimmed == "}" {
+                in_annotation_block = false;
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+
+    if !replaced {
+        return policy_text.to_string();
+    }
+
+    insert_policy_helper(&lines.concat(), CONTAINER_ANNOTATION_HELPERS)
 }
 
 fn insert_policy_helper(policy_text: &str, helper: &str) -> String {
@@ -1926,6 +1950,36 @@ allow_container_annotation(key, p_value, i_value) if {
         assert!(!normalized.contains(
             r#"print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
     p_value == i_value"#
+        ));
+    }
+
+    #[test]
+    fn allows_enclava_tools_name_for_generated_container_annotation_block() {
+        let policy = r#"default AllowRequestsFailingPolicy := false
+
+allow_container_annotation(p_oci, i_oci, key) if {
+    print("allow_container_annotation: key =", key)
+
+    p_value := p_oci.Annotations[key]
+    i_value := i_oci.Annotations[key]
+    print("allow_container_annotation: p_value =", p_value, "i_value =", i_value)
+
+    p_value == i_value
+
+    print("allow_container_annotation: true")
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(normalized.contains("allow_cap_container_annotation(key, p_value, i_value)"));
+        assert!(normalized.contains("key == \"io.kubernetes.cri.container-name\""));
+        assert!(normalized.contains("p_value == \"enclava-init\""));
+        assert!(normalized.contains("i_value == \"enclava-tools\""));
+        assert!(!normalized.contains(
+            r#"p_value == i_value
+
+    print("allow_container_annotation: true")"#
         ));
     }
 
