@@ -1,13 +1,16 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct OwnerStore {
@@ -44,8 +47,10 @@ impl OwnerStore {
     }
 
     fn connect(&self) -> Result<Connection> {
-        Connection::open(&self.path)
-            .with_context(|| format!("opening owner DB {}", self.path.display()))
+        let conn = Connection::open(&self.path)
+            .with_context(|| format!("opening owner DB {}", self.path.display()))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        Ok(conn)
     }
 
     fn initialize(&self) -> Result<()> {
@@ -82,7 +87,7 @@ impl OwnerStore {
         now: DateTime<Utc>,
     ) -> Result<BootstrapOutcome> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT owner_pubkey FROM owners WHERE org_id = ?1",
@@ -159,7 +164,7 @@ impl OwnerStore {
         now: DateTime<Utc>,
     ) -> Result<OwnerRecord> {
         let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(Vec<u8>, i64, String)> = tx
             .query_row(
                 "SELECT owner_pubkey, version, bootstrapped_at FROM owners WHERE org_id = ?1",
@@ -258,6 +263,27 @@ mod tests {
             .bootstrap_owner(org_id, other, fixed_time())
             .unwrap_err();
         assert!(err.to_string().contains("different owner"));
+    }
+
+    #[test]
+    fn bootstrap_waits_for_transient_sqlite_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owners.sqlite3");
+        let store = OwnerStore::open(&path).unwrap();
+        let lock_conn = Connection::open(&path).unwrap();
+        lock_conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let owner = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let store_for_thread = store.clone();
+        let handle = std::thread::spawn(move || {
+            store_for_thread.bootstrap_owner(org_id, owner, fixed_time())
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        lock_conn.execute_batch("COMMIT").unwrap();
+
+        assert_eq!(handle.join().unwrap().unwrap(), BootstrapOutcome::Created);
     }
 
     #[test]
