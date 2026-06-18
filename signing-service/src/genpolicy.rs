@@ -1102,7 +1102,7 @@ fn enclava_tools_container() -> Result<Value> {
             "/bin/sh",
             "-eu",
             "-c",
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers",
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready",
         ],
         "volumeMounts": [
             mount("enclava-tools", "/work", false),
@@ -1312,6 +1312,9 @@ mod tests {
         assert!(invocation
             .manifest_yaml
             .contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
         assert!(invocation.manifest_yaml.contains("mountPath: /work"));
         assert!(invocation.manifest_yaml.contains("mountPath: /run/enclava"));
         assert!(invocation.manifest_yaml.contains("name: unlock-channel"));
