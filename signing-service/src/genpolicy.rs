@@ -434,6 +434,7 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     let normalized = normalize_cap_sandbox_storages(&normalized);
     let normalized = normalize_cap_extra_storages(&normalized);
     let normalized = normalize_cap_oci_version(&normalized);
+    let normalized = normalize_cap_oci_readonly(&normalized);
     let normalized = normalize_cap_container_annotations(&normalized);
     normalize_privileged_caps_placeholder(&normalized)
 }
@@ -660,6 +661,49 @@ allow_cap_oci_version(policy_version, input_version) if {
 
     let normalized = policy_text.replace(OCI_VERSION_CHECK, OCI_VERSION_ALLOW);
     insert_policy_helper(&normalized, OCI_VERSION_HELPERS)
+}
+
+fn normalize_cap_oci_readonly(policy_text: &str) -> String {
+    const OCI_READONLY_CHECK: &str = "    p_oci.Readonly == i_oci.Readonly\n";
+    const OCI_READONLY_ALLOW: &str =
+        "    allow_cap_oci_readonly(p_oci, p_oci.Readonly, i_oci.Readonly)\n";
+    const OCI_READONLY_HELPERS: &str = r#"
+allow_cap_oci_readonly(_p_oci, p_readonly, i_readonly) if {
+    p_readonly == i_readonly
+}
+
+allow_cap_oci_readonly(p_oci, p_readonly, i_readonly) if {
+    p_readonly == true
+    i_readonly == false
+    p_oci.Annotations["io.kubernetes.cri.container-name"] == "web"
+    p_oci.Process.User.UID == 10001
+    p_oci.Process.User.GID == 10001
+    allow_cap_rootful_sudo_caps(p_oci.Process.Capabilities)
+}
+
+allow_cap_rootful_sudo_caps(capabilities) if {
+    allow_cap_has_cap(capabilities.Bounding, "CAP_SETUID")
+    allow_cap_has_cap(capabilities.Bounding, "CAP_SETGID")
+    allow_cap_has_cap(capabilities.Bounding, "CAP_SETFCAP")
+    allow_cap_has_cap(capabilities.Effective, "CAP_SETUID")
+    allow_cap_has_cap(capabilities.Effective, "CAP_SETGID")
+    allow_cap_has_cap(capabilities.Effective, "CAP_SETFCAP")
+    allow_cap_has_cap(capabilities.Permitted, "CAP_SETUID")
+    allow_cap_has_cap(capabilities.Permitted, "CAP_SETGID")
+    allow_cap_has_cap(capabilities.Permitted, "CAP_SETFCAP")
+}
+
+allow_cap_has_cap(capabilities, capability) if {
+    capabilities[_] == capability
+}
+"#;
+
+    if policy_text.contains("allow_cap_oci_readonly") || !policy_text.contains(OCI_READONLY_CHECK) {
+        return policy_text.to_string();
+    }
+
+    let normalized = policy_text.replace(OCI_READONLY_CHECK, OCI_READONLY_ALLOW);
+    insert_policy_helper(&normalized, OCI_READONLY_HELPERS)
 }
 
 fn normalize_cap_container_annotations(policy_text: &str) -> String {
@@ -2146,6 +2190,27 @@ allow_create_container_input(p_container) if {
         assert!(normalized.contains("policy_version == \"1.1.0\""));
         assert!(normalized.contains("input_version == \"1.3.0\""));
         assert!(!normalized.contains("p_oci.Version == i_oci.Version"));
+    }
+
+    #[test]
+    fn allows_managed_rootful_sudo_writable_oci_root() {
+        let policy = r#"default AllowRequestsFailingPolicy := false
+
+allow_create_container_input(p_container) if {
+    p_oci := p_container.OCI
+    print("CreateContainerRequest: p Readonly =", p_oci.Readonly, "i Readonly =", i_oci.Readonly)
+    p_oci.Readonly == i_oci.Readonly
+}
+"#;
+
+        let normalized = normalize_cap_generated_policy(policy);
+
+        assert!(
+            normalized.contains("allow_cap_oci_readonly(p_oci, p_oci.Readonly, i_oci.Readonly)")
+        );
+        assert!(normalized.contains("p_oci.Process.User.UID == 10001"));
+        assert!(normalized.contains("allow_cap_rootful_sudo_caps(p_oci.Process.Capabilities)"));
+        assert!(!normalized.contains("p_oci.Readonly == i_oci.Readonly"));
     }
 
     #[test]
