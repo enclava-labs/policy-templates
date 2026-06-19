@@ -375,7 +375,7 @@ fn validate_oci_security_floor(descriptor: &DeploymentDescriptor) -> Result<()> 
     if descriptor.oci_runtime_spec.security_context.privileged {
         bail!("descriptor security_context.privileged must be false");
     }
-    if has_rootful_sudo_profile_env(descriptor) && !is_rootful_sudo_profile(descriptor) {
+    if has_rootful_sudo_profile_env(descriptor) && !is_rootful_sudo_security_context(descriptor) {
         bail!(
             "descriptor rootful-sudo workload profile must match the managed sudo security context"
         );
@@ -384,7 +384,7 @@ fn validate_oci_security_floor(descriptor: &DeploymentDescriptor) -> Result<()> 
         .oci_runtime_spec
         .security_context
         .allow_privilege_escalation
-        && !is_rootful_sudo_profile(descriptor)
+        && !is_rootful_sudo_security_context(descriptor)
     {
         bail!("descriptor security_context.allow_privilege_escalation must be false");
     }
@@ -399,7 +399,7 @@ fn has_rootful_sudo_profile_env(descriptor: &DeploymentDescriptor) -> bool {
         .any(|env| env.name == "ENCLAVA_WORKLOAD_SECURITY_PROFILE" && env.value == "rootful-sudo")
 }
 
-fn is_rootful_sudo_profile(descriptor: &DeploymentDescriptor) -> bool {
+fn is_rootful_sudo_security_context(descriptor: &DeploymentDescriptor) -> bool {
     let security = &descriptor.oci_runtime_spec.security_context;
     let capabilities = &descriptor.oci_runtime_spec.capabilities;
     let add: BTreeSet<&str> = capabilities.add.iter().map(String::as_str).collect();
@@ -418,8 +418,7 @@ fn is_rootful_sudo_profile(descriptor: &DeploymentDescriptor) -> bool {
     let drop: BTreeSet<&str> = capabilities.drop.iter().map(String::as_str).collect();
     let expected_drop: BTreeSet<&str> = ["ALL"].into_iter().collect();
 
-    has_rootful_sudo_profile_env(descriptor)
-        && security.run_as_user == 10001
+    security.run_as_user == 10001
         && security.run_as_group == 10001
         && !security.read_only_root_fs
         && security.allow_privilege_escalation
