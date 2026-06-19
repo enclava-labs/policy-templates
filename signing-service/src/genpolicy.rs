@@ -416,7 +416,8 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
 
         if uid.is_some_and(|uid| uid != 0) {
             if let (Some(start), Some(end)) = (gids_start, gids_end) {
-                let normalized_gids = normalized_additional_gids(&lines[(start + 1)..end]);
+                let normalized_gids =
+                    normalized_additional_gids(uid.unwrap_or_default(), &lines[(start + 1)..end]);
                 lines.splice((start + 1)..end, normalized_gids);
                 idx = start + 1;
                 continue;
@@ -786,15 +787,31 @@ fn normalize_privileged_caps_placeholder(policy_text: &str) -> String {
     policy_text.replace("\"CAP_$(privileged_caps)\"", "\"$(privileged_caps)\"")
 }
 
-fn normalized_additional_gids(group_lines: &[String]) -> Vec<String> {
-    group_lines
+fn normalized_additional_gids(uid: u32, group_lines: &[String]) -> Vec<String> {
+    let mut groups = group_lines
         .iter()
         .filter(|line| {
             let trimmed = line.trim();
             trimmed != "0" && trimmed != "0,"
         })
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+
+    if uid == 10001
+        && !groups.iter().any(|line| {
+            let trimmed = line.trim();
+            trimmed == "27" || trimmed == "27,"
+        })
+    {
+        if let Some(insert_at) = groups.iter().position(|line| {
+            let trimmed = line.trim();
+            trimmed == "10001" || trimmed == "10001,"
+        }) {
+            groups.insert(insert_at, "              27,\n".to_string());
+        }
+    }
+
+    groups
 }
 
 fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
@@ -2011,6 +2028,22 @@ mod tests {
           }
         }
       }
+    },
+    {
+      "OCI": {
+        "Process": {
+          "User": {
+            "UID": 10001,
+            "GID": 10001,
+            "AdditionalGids": [
+              0,
+              6,
+              10001
+            ],
+            "Username": ""
+          }
+        }
+      }
     }
   ]
 }
@@ -2033,6 +2066,15 @@ mod tests {
             "AdditionalGids": [
               0,
               6,
+              10001
+            ]"#
+        ));
+        assert!(normalized.contains(
+            r#""UID": 10001,
+            "GID": 10001,
+            "AdditionalGids": [
+              6,
+              27,
               10001
             ]"#
         ));
