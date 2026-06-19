@@ -664,6 +664,9 @@ allow_cap_oci_version(policy_version, input_version) if {
 }
 
 fn normalize_cap_oci_readonly(policy_text: &str) -> String {
+    const OCI_ROOT_READONLY_CHECK: &str = "    p_oci.Root.Readonly == i_oci.Root.Readonly\n";
+    const OCI_ROOT_READONLY_ALLOW: &str =
+        "    allow_cap_oci_readonly(p_oci, p_oci.Root.Readonly, i_oci.Root.Readonly)\n";
     const OCI_READONLY_CHECK: &str = "    p_oci.Readonly == i_oci.Readonly\n";
     const OCI_READONLY_ALLOW: &str =
         "    allow_cap_oci_readonly(p_oci, p_oci.Readonly, i_oci.Readonly)\n";
@@ -698,11 +701,17 @@ allow_cap_has_cap(capabilities, capability) if {
 }
 "#;
 
-    if policy_text.contains("allow_cap_oci_readonly") || !policy_text.contains(OCI_READONLY_CHECK) {
+    if policy_text.contains("allow_cap_oci_readonly") {
         return policy_text.to_string();
     }
 
-    let normalized = policy_text.replace(OCI_READONLY_CHECK, OCI_READONLY_ALLOW);
+    let normalized = policy_text
+        .replace(OCI_ROOT_READONLY_CHECK, OCI_ROOT_READONLY_ALLOW)
+        .replace(OCI_READONLY_CHECK, OCI_READONLY_ALLOW);
+    if normalized == policy_text {
+        return policy_text.to_string();
+    }
+
     insert_policy_helper(&normalized, OCI_READONLY_HELPERS)
 }
 
@@ -2198,19 +2207,18 @@ allow_create_container_input(p_container) if {
 
 allow_create_container_input(p_container) if {
     p_oci := p_container.OCI
-    print("CreateContainerRequest: p Readonly =", p_oci.Readonly, "i Readonly =", i_oci.Readonly)
-    p_oci.Readonly == i_oci.Readonly
+    print("CreateContainerRequest: p Readonly =", p_oci.Root.Readonly, "i Readonly =", i_oci.Root.Readonly)
+    p_oci.Root.Readonly == i_oci.Root.Readonly
 }
 "#;
 
         let normalized = normalize_cap_generated_policy(policy);
 
-        assert!(
-            normalized.contains("allow_cap_oci_readonly(p_oci, p_oci.Readonly, i_oci.Readonly)")
-        );
+        assert!(normalized
+            .contains("allow_cap_oci_readonly(p_oci, p_oci.Root.Readonly, i_oci.Root.Readonly)"));
         assert!(normalized.contains("p_oci.Process.User.UID == 10001"));
         assert!(normalized.contains("allow_cap_rootful_sudo_caps(p_oci.Process.Capabilities)"));
-        assert!(!normalized.contains("p_oci.Readonly == i_oci.Readonly"));
+        assert!(!normalized.contains("p_oci.Root.Readonly == i_oci.Root.Readonly"));
     }
 
     #[test]
