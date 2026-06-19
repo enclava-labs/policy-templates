@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::OsRng;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::{
@@ -371,17 +372,60 @@ fn validate_rego_string_slot(name: &str, value: &str) -> Result<()> {
 }
 
 fn validate_oci_security_floor(descriptor: &DeploymentDescriptor) -> Result<()> {
+    if descriptor.oci_runtime_spec.security_context.privileged {
+        bail!("descriptor security_context.privileged must be false");
+    }
+    if has_rootful_sudo_profile_env(descriptor) && !is_rootful_sudo_profile(descriptor) {
+        bail!(
+            "descriptor rootful-sudo workload profile must match the managed sudo security context"
+        );
+    }
     if descriptor
         .oci_runtime_spec
         .security_context
         .allow_privilege_escalation
+        && !is_rootful_sudo_profile(descriptor)
     {
         bail!("descriptor security_context.allow_privilege_escalation must be false");
     }
-    if descriptor.oci_runtime_spec.security_context.privileged {
-        bail!("descriptor security_context.privileged must be false");
-    }
     Ok(())
+}
+
+fn has_rootful_sudo_profile_env(descriptor: &DeploymentDescriptor) -> bool {
+    descriptor
+        .oci_runtime_spec
+        .env
+        .iter()
+        .any(|env| env.name == "ENCLAVA_WORKLOAD_SECURITY_PROFILE" && env.value == "rootful-sudo")
+}
+
+fn is_rootful_sudo_profile(descriptor: &DeploymentDescriptor) -> bool {
+    let security = &descriptor.oci_runtime_spec.security_context;
+    let capabilities = &descriptor.oci_runtime_spec.capabilities;
+    let add: BTreeSet<&str> = capabilities.add.iter().map(String::as_str).collect();
+    let expected_add: BTreeSet<&str> = [
+        "CHOWN",
+        "DAC_OVERRIDE",
+        "FOWNER",
+        "FSETID",
+        "MKNOD",
+        "SETFCAP",
+        "SETGID",
+        "SETUID",
+    ]
+    .into_iter()
+    .collect();
+    let drop: BTreeSet<&str> = capabilities.drop.iter().map(String::as_str).collect();
+    let expected_drop: BTreeSet<&str> = ["ALL"].into_iter().collect();
+
+    has_rootful_sudo_profile_env(descriptor)
+        && security.run_as_user == 10001
+        && security.run_as_group == 10001
+        && !security.read_only_root_fs
+        && security.allow_privilege_escalation
+        && !security.privileged
+        && add == expected_add
+        && drop == expected_drop
 }
 
 #[cfg(test)]
@@ -392,7 +436,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        descriptor::{tests::fixed_descriptor, DeploymentDescriptorEnvelope},
+        descriptor::{
+            tests::fixed_descriptor, Capabilities, DeploymentDescriptor,
+            DeploymentDescriptorEnvelope, EnvVar, SecurityContext,
+        },
         genpolicy::{GeneratedAgentPolicy, GenpolicyInvocation},
         keyring::tests::{fixed_deployer_key, fixed_keyring, fixed_owner_key, sign_keyring},
     };
@@ -448,19 +495,51 @@ mod tests {
     }
 
     fn verified_inputs() -> VerifiedSigningInputs {
+        verified_inputs_for_descriptor(descriptor_for_service()).unwrap()
+    }
+
+    fn verified_inputs_for_descriptor(
+        descriptor: DeploymentDescriptor,
+    ) -> Result<VerifiedSigningInputs> {
         let owner = fixed_owner_key();
         let deployer = fixed_deployer_key();
         let keyring = sign_keyring(&owner, fixed_keyring(&owner, &deployer));
         let keyring_envelope_value = serde_json::to_value(&keyring).unwrap();
         verify_signing_inputs(
             DecodedSigningBlobs {
-                descriptor_envelope: signed_descriptor_envelope(descriptor_for_service()),
+                descriptor_envelope: signed_descriptor_envelope(descriptor),
                 keyring_envelope: keyring,
                 keyring_envelope_value,
             },
             &owner.verifying_key(),
         )
-        .unwrap()
+    }
+
+    fn apply_rootful_sudo_profile(descriptor: &mut DeploymentDescriptor) {
+        descriptor.oci_runtime_spec.env.push(EnvVar {
+            name: "ENCLAVA_WORKLOAD_SECURITY_PROFILE".to_string(),
+            value: "rootful-sudo".to_string(),
+        });
+        descriptor.oci_runtime_spec.security_context = SecurityContext {
+            run_as_user: 10001,
+            run_as_group: 10001,
+            read_only_root_fs: false,
+            allow_privilege_escalation: true,
+            privileged: false,
+        };
+        descriptor.oci_runtime_spec.capabilities = Capabilities {
+            drop: vec!["ALL".to_string()],
+            add: vec![
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FOWNER".to_string(),
+                "FSETID".to_string(),
+                "MKNOD".to_string(),
+                "SETFCAP".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+            ],
+        };
     }
 
     fn sign_request_for(descriptor: &DeploymentDescriptor) -> SignRequest {
@@ -566,6 +645,87 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("descriptor signature"));
+    }
+
+    #[test]
+    fn privilege_escalation_without_managed_profile_rejects() {
+        let mut descriptor = descriptor_for_service();
+        descriptor
+            .oci_runtime_spec
+            .security_context
+            .allow_privilege_escalation = true;
+        let inputs = verified_inputs_for_descriptor(descriptor).unwrap();
+        let req = sign_request_for(&inputs.descriptor);
+        let key_material = SigningKeyMaterial {
+            key_id: "policy-test-key-v1".to_string(),
+            signing_key: fixed_service_key(),
+        };
+
+        let err = sign_verified_policy(
+            &req,
+            inputs,
+            generated_agent_policy(),
+            &key_material,
+            fixed_time(),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("allow_privilege_escalation must be false"));
+    }
+
+    #[test]
+    fn managed_rootful_sudo_profile_accepts_exact_security_context() {
+        let mut descriptor = descriptor_for_service();
+        apply_rootful_sudo_profile(&mut descriptor);
+        let inputs = verified_inputs_for_descriptor(descriptor).unwrap();
+        let req = sign_request_for(&inputs.descriptor);
+        let key_material = SigningKeyMaterial {
+            key_id: "policy-test-key-v1".to_string(),
+            signing_key: fixed_service_key(),
+        };
+
+        let artifact = sign_verified_policy(
+            &req,
+            inputs,
+            generated_agent_policy(),
+            &key_material,
+            fixed_time(),
+        )
+        .unwrap();
+
+        assert_eq!(artifact.metadata.key_id, "policy-test-key-v1");
+    }
+
+    #[test]
+    fn managed_rootful_sudo_profile_rejects_extra_capability() {
+        let mut descriptor = descriptor_for_service();
+        apply_rootful_sudo_profile(&mut descriptor);
+        descriptor
+            .oci_runtime_spec
+            .capabilities
+            .add
+            .push("SYS_ADMIN".to_string());
+        let inputs = verified_inputs_for_descriptor(descriptor).unwrap();
+        let req = sign_request_for(&inputs.descriptor);
+        let key_material = SigningKeyMaterial {
+            key_id: "policy-test-key-v1".to_string(),
+            signing_key: fixed_service_key(),
+        };
+
+        let err = sign_verified_policy(
+            &req,
+            inputs,
+            generated_agent_policy(),
+            &key_material,
+            fixed_time(),
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("rootful-sudo workload profile must match"));
     }
 
     #[test]

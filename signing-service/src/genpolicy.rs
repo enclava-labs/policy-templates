@@ -985,6 +985,12 @@ fn caps(drop: &[&str], add: &[&str]) -> Value {
     Value::Object(capabilities)
 }
 
+fn caps_from_descriptor(drop: &[String], add: &[String]) -> Value {
+    let drop = drop.iter().map(String::as_str).collect::<Vec<_>>();
+    let add = add.iter().map(String::as_str).collect::<Vec<_>>();
+    caps(&drop, &add)
+}
+
 fn security_context(
     run_as_user: u32,
     run_as_group: u32,
@@ -1001,6 +1007,29 @@ fn security_context(
         "privileged": privileged,
         "capabilities": capabilities,
     })
+}
+
+fn app_security_context(descriptor: &DeploymentDescriptor) -> Value {
+    let oci = &descriptor.oci_runtime_spec;
+    let security = &oci.security_context;
+    if security.run_as_user == 0
+        && security.run_as_group == 0
+        && !security.read_only_root_fs
+        && !security.allow_privilege_escalation
+        && !security.privileged
+        && oci.capabilities.drop.is_empty()
+        && oci.capabilities.add.is_empty()
+    {
+        return security_context(10001, 10001, true, false, false, caps(&["ALL"], &[]));
+    }
+    security_context(
+        security.run_as_user,
+        security.run_as_group,
+        security.read_only_root_fs,
+        security.allow_privilege_escalation,
+        security.privileged,
+        caps_from_descriptor(&oci.capabilities.drop, &oci.capabilities.add),
+    )
 }
 
 fn resources(
@@ -1047,7 +1076,7 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
             "protocol": port.protocol,
         })).collect::<Vec<_>>(),
         "volumeMounts": volume_mounts,
-        "securityContext": security_context(10001, 10001, true, false, false, caps(&["ALL"], &[])),
+        "securityContext": app_security_context(descriptor),
         "resources": ResourcesYaml::from(&oci.resources),
     })
 }
@@ -1308,7 +1337,7 @@ fn _assert_manifest_path(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{tests::fixed_descriptor, Mount};
+    use crate::descriptor::{tests::fixed_descriptor, Capabilities, Mount, SecurityContext};
 
     #[test]
     fn invocation_pins_binary_settings_and_manifest_input() {
@@ -1555,6 +1584,41 @@ mod tests {
                 .iter()
                 .all(|container| container.pointer("/name") != Some(&json!("enclava-tools"))),
             "enclava-tools is an init container in the live CAP manifest"
+        );
+    }
+
+    #[test]
+    fn app_policy_manifest_uses_descriptor_security_context() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.security_context = SecurityContext {
+            run_as_user: 10001,
+            run_as_group: 10001,
+            read_only_root_fs: false,
+            allow_privilege_escalation: true,
+            privileged: false,
+        };
+        descriptor.oci_runtime_spec.capabilities = Capabilities {
+            drop: vec!["ALL".to_string()],
+            add: vec!["SETUID".to_string(), "SETGID".to_string()],
+        };
+
+        let container = app_container(&descriptor);
+
+        assert_eq!(
+            container.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/allowPrivilegeEscalation"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/add/0"),
+            Some(&json!("SETUID"))
         );
     }
 
