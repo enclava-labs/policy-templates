@@ -22,6 +22,7 @@ const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attesta
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
+const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-proxy";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
@@ -1019,7 +1020,10 @@ fn enclava_init_container() -> Result<Value> {
             value_env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             value_env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
             value_env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
-            value_env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", "web,tenant-ingress"),
+            value_env(
+                "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
+                ENCLAVA_INIT_WAIT_FOR_CONTAINERS,
+            ),
         ]),
         "volumeMounts": [
             mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
@@ -1311,6 +1315,39 @@ mod tests {
                 .iter()
                 .all(|container| container.pointer("/name") != Some(&json!("enclava-tools"))),
             "enclava-tools is an init container in the live CAP manifest"
+        );
+    }
+
+    #[test]
+    fn enclava_init_waits_for_the_same_sidecars_as_live_cap_manifest() {
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
+        let containers = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .expect("CAP genpolicy manifest must include containers");
+        let enclava_init = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("enclava-init")))
+            .expect("enclava-init container is present");
+        let env = enclava_init
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("enclava-init env is present");
+        let wait_for_containers = env
+            .iter()
+            .find(|entry| {
+                entry.pointer("/name") == Some(&json!("ENCLAVA_INIT_WAIT_FOR_CONTAINERS"))
+            })
+            .expect("enclava-init wait-list env is present");
+
+        assert_eq!(
+            wait_for_containers.pointer("/value"),
+            Some(&json!(ENCLAVA_INIT_WAIT_FOR_CONTAINERS))
+        );
+        assert_eq!(
+            wait_for_containers.pointer("/value"),
+            Some(&json!("web,tenant-ingress,attestation-proxy"))
         );
     }
 
