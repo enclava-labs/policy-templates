@@ -75,7 +75,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: signing-service
-          image: ghcr.io/enclava-ai/policy-signing-service:replace-with-digest
+          image: ghcr.io/enclava-labs/policy-signing-service:replace-with-digest
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -124,7 +124,7 @@ export ENCLAVA_POLICY_ARTIFACT_SIGNING_SEED_HEX=<deployment-key-seed-hex>
 docker run --rm \
   -e ENCLAVA_POLICY_ARTIFACT_SIGNING_SEED_HEX \
   -v "$PWD:/work" -w /work \
-  ghcr.io/enclava-ai/policy-signing-service:<version> \
+  ghcr.io/enclava-labs/policy-signing-service:<version> \
   /usr/local/bin/enclava-policy-artifact \
   --request sign-request.json \
   --owner-pubkey-hex <trusted-org-owner-pubkey-hex> \

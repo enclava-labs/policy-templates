@@ -18,8 +18,8 @@ const KATA_HYPERVISOR_CC_INIT_DATA_ANNOTATION: &str =
 const KATA_RUNTIME_CC_INIT_DATA_ANNOTATION: &str = "io.katacontainers.config.runtime.cc_init_data";
 const KATA_RUNTIME_HANDLER: &str = "kata-qemu-snp";
 const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
-const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-ai/attestation-proxy";
-const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-ai/caddy-ingress";
+const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
+const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
@@ -627,7 +627,7 @@ fn enclava_init_image() -> Result<String> {
     let image = match std::env::var("ENCLAVA_INIT_IMAGE") {
         Ok(image) => image,
         Err(_err) if cfg!(test) => {
-            "ghcr.io/enclava-ai/enclava-init@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            "ghcr.io/enclava-labs/enclava-init@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
         }
         Err(err) => return Err(err).context("ENCLAVA_INIT_IMAGE must be set for CAP genpolicy sidecars"),
     };
@@ -1225,7 +1225,14 @@ mod tests {
         assert!(invocation.manifest_yaml.contains("value: '10001'"));
         assert!(invocation
             .manifest_yaml
-            .contains("image: ghcr.io/enclava-ai/demo@sha256:aaaa"));
+            .contains("image: ghcr.io/enclava-labs/demo@sha256:aaaa"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("image: ghcr.io/enclava-labs/attestation-proxy@sha256:1111"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("image: ghcr.io/enclava-labs/caddy-ingress@sha256:2222"));
+        assert!(!invocation.manifest_yaml.contains("ghcr.io/enclava-ai/"));
         assert!(invocation
             .manifest_yaml
             .contains("- /enclava-tools/enclava-wait-exec"));
