@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::descriptor::{DeploymentDescriptor, EnvVar, Resources};
+use crate::descriptor::{Capabilities, DeploymentDescriptor, EnvVar, OciRuntimeSpec, Resources};
 
 const KATA_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
 const KATA_KERNEL_PARAMS_ANNOTATION: &str = "io.katacontainers.config.hypervisor.kernel_params";
@@ -24,6 +24,9 @@ const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
+const CAP_CONFIG_FILE_GID: &str = "10001";
+const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
+    &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 fn tenant_caddy_internal_tls_enabled() -> bool {
     std::env::var("TENANT_CADDY_TLS_MODE")
@@ -711,6 +714,21 @@ fn caps(drop: &[&str], add: &[&str]) -> Value {
     Value::Object(capabilities)
 }
 
+fn caps_from_descriptor(capabilities: &Capabilities) -> Value {
+    let drop = capabilities.drop.iter().map(|value| json!(value)).collect();
+    let add = capabilities
+        .add
+        .iter()
+        .map(|value| json!(value))
+        .collect::<Vec<_>>();
+    let mut out = Map::new();
+    out.insert("drop".to_string(), Value::Array(drop));
+    if !add.is_empty() {
+        out.insert("add".to_string(), Value::Array(add));
+    }
+    Value::Object(out)
+}
+
 fn security_context(
     run_as_user: u32,
     run_as_group: u32,
@@ -727,6 +745,58 @@ fn security_context(
         "privileged": privileged,
         "capabilities": capabilities,
     })
+}
+
+fn restricted_app_security_context() -> Value {
+    security_context(10001, 10001, true, false, false, caps(&["ALL"], &[]))
+}
+
+fn descriptor_has_legacy_unset_security(oci: &OciRuntimeSpec) -> bool {
+    oci.security_context.run_as_user == 0
+        && oci.security_context.run_as_group == 0
+        && !oci.security_context.read_only_root_fs
+        && !oci.security_context.allow_privilege_escalation
+        && !oci.security_context.privileged
+        && oci.capabilities.add.is_empty()
+        && oci.capabilities.drop.is_empty()
+}
+
+fn app_security_context_from_descriptor(oci: &OciRuntimeSpec) -> Value {
+    if descriptor_has_legacy_unset_security(oci) {
+        return restricted_app_security_context();
+    }
+    security_context(
+        oci.security_context.run_as_user,
+        oci.security_context.run_as_group,
+        oci.security_context.read_only_root_fs,
+        oci.security_context.allow_privilege_escalation,
+        oci.security_context.privileged,
+        caps_from_descriptor(&oci.capabilities),
+    )
+}
+
+fn descriptor_uses_startup_fallback(descriptor: &DeploymentDescriptor) -> bool {
+    descriptor.oci_runtime_spec.args.is_empty()
+}
+
+fn descriptor_uses_platform_managed_ssh_relay(descriptor: &DeploymentDescriptor) -> bool {
+    let oci = &descriptor.oci_runtime_spec;
+    oci.security_context.run_as_user == 0
+        && oci.security_context.run_as_group == 0
+        && oci.security_context.read_only_root_fs
+        && !oci.security_context.allow_privilege_escalation
+        && !oci.security_context.privileged
+        && oci
+            .capabilities
+            .drop
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("ALL"))
+        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+            oci.capabilities
+                .add
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(required))
+        })
 }
 
 fn resources(
@@ -749,12 +819,17 @@ fn resources(
 
 fn app_container(descriptor: &DeploymentDescriptor) -> Value {
     let oci = &descriptor.oci_runtime_spec;
-    let volume_mounts = vec![
-        mount("enclava-tools", "/enclava-tools", true),
-        mount("startup", "/startup", true),
-        mount("unlock-socket", "/run/enclava", false),
-        mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
-    ];
+    let mut volume_mounts = vec![mount("enclava-tools", "/enclava-tools", true)];
+    if descriptor_uses_startup_fallback(descriptor) {
+        volume_mounts.push(mount("startup", "/startup", true));
+    }
+    volume_mounts.push(mount("unlock-socket", "/run/enclava", false));
+    volume_mounts.push(mount_with_propagation(
+        "state-mount",
+        "/state",
+        false,
+        "HostToContainer",
+    ));
     let env = with_kubernetes_service_env(
         oci.env
             .iter()
@@ -765,7 +840,11 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
     json!({
         "name": "web",
         "image": descriptor.image_ref,
-        "command": [ENCLAVA_WAIT_EXEC_PATH],
+        "command": if oci.command.is_empty() {
+            vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
+        } else {
+            oci.command.clone()
+        },
         "args": oci.args,
         "env": env,
         "ports": oci.ports.iter().map(|port| json!({
@@ -773,7 +852,7 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
             "protocol": port.protocol,
         })).collect::<Vec<_>>(),
         "volumeMounts": volume_mounts,
-        "securityContext": security_context(10001, 10001, true, false, false, caps(&["ALL"], &[])),
+        "securityContext": app_security_context_from_descriptor(oci),
         "resources": ResourcesYaml::from(&oci.resources),
     })
 }
@@ -822,6 +901,9 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             "/run/enclava-unlock/unlock.sock",
         ),
     ]);
+    if !descriptor_uses_platform_managed_ssh_relay(descriptor) {
+        env_vars.push(value_env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
+    }
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
         env_vars.push(value_env("KBS_RESOURCE_CA_CERT_PEM", cert));
     }
@@ -955,14 +1037,13 @@ fn enclava_init_container() -> Result<Value> {
 }
 
 fn cap_volumes(descriptor: &DeploymentDescriptor) -> Vec<Value> {
-    vec![
+    let mut volumes = vec![
         json!({"name": "logs", "emptyDir": {}}),
         json!({"name": "ownership-signal", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         config_map_volume(
             "tenant-ingress-caddyfile",
             format!("{}-tenant-ingress", descriptor.app_name),
         ),
-        config_map_volume("startup", format!("{}-startup", descriptor.app_name)),
         json!({"name": "enclava-tools", "emptyDir": {}}),
         json!({"name": "unlock-socket", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-channel", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
@@ -972,7 +1053,14 @@ fn cap_volumes(descriptor: &DeploymentDescriptor) -> Vec<Value> {
             "enclava-init-config",
             format!("{}-enclava-init", descriptor.app_name),
         ),
-    ]
+    ];
+    if descriptor_uses_startup_fallback(descriptor) {
+        volumes.insert(
+            3,
+            config_map_volume("startup", format!("{}-startup", descriptor.app_name)),
+        );
+    }
+    volumes
 }
 
 fn config_map_volume(name: &str, config_map_name: String) -> Value {
@@ -1020,7 +1108,7 @@ fn _assert_manifest_path(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{tests::fixed_descriptor, Mount};
+    use crate::descriptor::{tests::fixed_descriptor, Capabilities, Mount, SecurityContext};
 
     #[test]
     fn invocation_pins_binary_settings_and_manifest_input() {
@@ -1240,6 +1328,8 @@ mod tests {
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
         assert!(manifest.contains("value: /state/.enclava/config"));
+        assert!(manifest.contains("name: CAP_CONFIG_FILE_GID"));
+        assert!(manifest.contains("value: '10001'"));
         assert!(manifest.contains("mountPath: /state"));
         let mounts = container
             .pointer("/volumeMounts")
@@ -1253,6 +1343,92 @@ mod tests {
             })
             .expect("attestation-proxy can read enclava-init readiness file");
         assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn platform_managed_ssh_relay_descriptor_renders_root_supervisor_policy_input() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.command = vec![ENCLAVA_WAIT_EXEC_PATH.to_string()];
+        descriptor.oci_runtime_spec.args =
+            vec!["/usr/local/bin/debian-ssh-frp-entrypoint".to_string()];
+        descriptor.oci_runtime_spec.capabilities = Capabilities {
+            drop: vec!["ALL".to_string()],
+            add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+                .iter()
+                .map(|cap| (*cap).to_string())
+                .collect(),
+        };
+        descriptor.oci_runtime_spec.security_context = SecurityContext {
+            run_as_user: 0,
+            run_as_group: 0,
+            read_only_root_fs: true,
+            allow_privilege_escalation: false,
+            privileged: false,
+        };
+
+        let container = app_container(&descriptor);
+        assert_eq!(
+            container.pointer("/securityContext/runAsUser"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/runAsGroup"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/allowPrivilegeEscalation"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/privileged"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
+        );
+        let added_caps = container
+            .pointer("/securityContext/capabilities/add")
+            .and_then(Value::as_array)
+            .expect("relay capabilities are rendered");
+        for cap in PLATFORM_MANAGED_SSH_RELAY_CAPS {
+            assert!(
+                added_caps.iter().any(|value| value == &json!(cap)),
+                "missing {cap}"
+            );
+        }
+        assert!(
+            container
+                .pointer("/volumeMounts")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .all(|mount| mount.pointer("/name") != Some(&json!("startup"))),
+            "explicit-command relay apps must not mount startup"
+        );
+
+        let proxy = attestation_proxy_container(&descriptor).unwrap();
+        let env = proxy
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("proxy env is rendered");
+        assert!(
+            env.iter()
+                .all(|entry| entry.pointer("/name") != Some(&json!("CAP_CONFIG_FILE_GID"))),
+            "relay profile keeps managed config root-only"
+        );
+
+        let volumes = cap_volumes(&descriptor);
+        assert!(
+            volumes
+                .iter()
+                .all(|volume| volume.pointer("/name") != Some(&json!("startup"))),
+            "explicit-command relay apps must not include unused startup volume"
+        );
     }
 
     #[test]
