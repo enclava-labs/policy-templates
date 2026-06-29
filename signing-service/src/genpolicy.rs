@@ -21,6 +21,7 @@ const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cl
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
@@ -987,7 +988,7 @@ fn enclava_tools_container() -> Result<Value> {
             "/bin/sh",
             "-eu",
             "-c",
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers",
+            ENCLAVA_TOOLS_INIT_COMMAND,
         ],
         "volumeMounts": [
             mount("enclava-tools", "/work", false),
@@ -1200,6 +1201,11 @@ mod tests {
         assert!(invocation
             .manifest_yaml
             .contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+        assert!(invocation.manifest_yaml.contains("not-ready"));
+        assert!(invocation.manifest_yaml.contains("/run/enclava/init-ready"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("chmod 0644 /run/enclava/init-ready"));
         assert!(invocation.manifest_yaml.contains("mountPath: /work"));
         assert!(invocation.manifest_yaml.contains("mountPath: /run/enclava"));
         assert!(invocation.manifest_yaml.contains("name: unlock-channel"));
@@ -1282,11 +1288,10 @@ mod tests {
             Some(&json!(true))
         );
         assert_eq!(enclava_tools.pointer("/command/1"), Some(&json!("-eu")));
-        assert!(enclava_tools
-            .pointer("/command/3")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+        assert_eq!(
+            enclava_tools.pointer("/command/3"),
+            Some(&json!(ENCLAVA_TOOLS_INIT_COMMAND))
+        );
         let tool_mounts = enclava_tools
             .pointer("/volumeMounts")
             .and_then(Value::as_array)
