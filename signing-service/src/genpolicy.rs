@@ -861,6 +861,7 @@ fn required_config_keys_from_descriptor(descriptor: &DeploymentDescriptor) -> Op
         .oci_runtime_spec
         .command
         .iter()
+        .chain(descriptor.oci_runtime_spec.args.iter())
         .find_map(|arg| required_config_keys_from_arg(arg))
 }
 
@@ -1602,6 +1603,24 @@ mod tests {
         assert_eq!(
             env_value(&container, "CAP_CONFIG_REQUIRED_KEYS"),
             Some(&json!("FRP_SERVER_ADDR,FRP_AUTH_TOKEN"))
+        );
+    }
+
+    #[test]
+    fn attestation_proxy_derives_required_config_keys_from_descriptor_args() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.command = vec![ENCLAVA_WAIT_EXEC_PATH.to_string()];
+        descriptor.oci_runtime_spec.args = vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "DEBIAN_SSH_RESTART_WRAPPER=1 ENCLAVA_REQUIRED_CONFIG_KEYS=FRP_SERVER_ADDR,FRP_SERVER_PORT,FRP_AUTH_TOKEN exec /usr/local/bin/debian-ssh-frp-entrypoint".to_string(),
+        ];
+
+        let container = attestation_proxy_container(&descriptor).unwrap();
+
+        assert_eq!(
+            env_value(&container, "CAP_CONFIG_REQUIRED_KEYS"),
+            Some(&json!("FRP_SERVER_ADDR,FRP_SERVER_PORT,FRP_AUTH_TOKEN"))
         );
     }
 
