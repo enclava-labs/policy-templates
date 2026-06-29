@@ -1142,6 +1142,9 @@ fn enclava_init_container() -> Result<Value> {
                 "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
                 ENCLAVA_INIT_WAIT_FOR_CONTAINERS,
             ),
+            value_env("KBS_FETCH_RETRIES", "120"),
+            value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
         ]),
         "volumeMounts": [
             mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
@@ -1474,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn enclava_init_waits_for_the_same_sidecars_as_live_cap_manifest() {
+    fn enclava_init_env_matches_live_cap_sidecar_contract() {
         let manifest: Value =
             serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
         let containers = manifest
@@ -1504,6 +1507,18 @@ mod tests {
             wait_for_containers.pointer("/value"),
             Some(&json!("web,tenant-ingress,attestation-proxy"))
         );
+
+        for (name, value) in [
+            ("KBS_FETCH_RETRIES", "120"),
+            ("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            ("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
+        ] {
+            let entry = env
+                .iter()
+                .find(|entry| entry.pointer("/name") == Some(&json!(name)))
+                .unwrap_or_else(|| panic!("enclava-init env {name} is present"));
+            assert_eq!(entry.pointer("/value"), Some(&json!(value)));
+        }
     }
 
     #[test]
