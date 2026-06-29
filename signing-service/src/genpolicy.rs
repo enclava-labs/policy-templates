@@ -26,14 +26,60 @@ const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-p
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
+const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
+    "trap 'exit 0' TERM INT\n",
+    "i=0\n",
+    "while [ \"$i\" -lt 300 ]; do\n",
+    "  if [ -r '/run/enclava/caddy-runtime/certificates/tls.crt' ] && [ -r '/run/enclava/caddy-runtime/certificates/tls.key' ]; then break; fi\n",
+    "  if [ \"$i\" = 0 ] || [ $((i % 10)) -eq 0 ]; then echo 'tenant-ingress waiting for TLS certificate handoff' >&2; fi\n",
+    "  i=$((i + 1))\n",
+    "  sleep 1\n",
+    "done\n",
+    "if [ ! -r '/run/enclava/caddy-runtime/certificates/tls.crt' ] || [ ! -r '/run/enclava/caddy-runtime/certificates/tls.key' ]; then echo 'tenant-ingress TLS certificate handoff missing or unreadable' >&2; exit 1; fi\n",
+    "while true; do\n",
+    "  rc=0\n",
+    "  if /usr/bin/caddy validate --config /etc/caddy/Caddyfile; then\n",
+    "    /usr/bin/caddy run --config /etc/caddy/Caddyfile || rc=$?\n",
+    "  else\n",
+    "    rc=$?\n",
+    "  fi\n",
+    "  echo \"tenant-ingress caddy exited rc=$rc; restarting in 5s\" >&2\n",
+    "  sleep 5\n",
+    "done"
+);
+const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
 const CAP_CONFIG_FILE_GID: &str = "10001";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
-fn tenant_caddy_internal_tls_enabled() -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaddyTlsMode {
+    Acme,
+    Dns01Broker,
+    Internal,
+}
+
+impl std::str::FromStr for CaddyTlsMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "acme" => Ok(Self::Acme),
+            "dns01-broker" | "dns-01-broker" | "broker" => Ok(Self::Dns01Broker),
+            "internal" => Ok(Self::Internal),
+            other => Err(format!(
+                "invalid tenant Caddy TLS mode {other:?}; expected acme, dns01-broker, or internal"
+            )),
+        }
+    }
+}
+
+fn tenant_caddy_tls_mode() -> Result<CaddyTlsMode> {
     std::env::var("TENANT_CADDY_TLS_MODE")
-        .map(|value| value.eq_ignore_ascii_case("internal"))
-        .unwrap_or(false)
+        .unwrap_or_default()
+        .parse::<CaddyTlsMode>()
+        .map_err(anyhow::Error::msg)
+        .context("TENANT_CADDY_TLS_MODE")
 }
 
 fn trustee_kbs_url() -> String {
@@ -580,7 +626,7 @@ fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
             "containers": [
                 app_container(descriptor),
                 attestation_proxy_container(descriptor)?,
-                tenant_ingress_container(descriptor),
+                tenant_ingress_container(descriptor)?,
                 enclava_init_container()?,
             ],
             "volumes": cap_volumes(descriptor),
@@ -801,6 +847,56 @@ fn descriptor_uses_platform_managed_ssh_relay(descriptor: &DeploymentDescriptor)
         })
 }
 
+fn required_config_keys_from_descriptor(descriptor: &DeploymentDescriptor) -> Option<String> {
+    if let Some(value) = descriptor
+        .oci_runtime_spec
+        .env
+        .iter()
+        .find(|entry| entry.name == "ENCLAVA_REQUIRED_CONFIG_KEYS")
+        .and_then(|entry| normalize_required_config_keys(&entry.value))
+    {
+        return Some(value);
+    }
+    descriptor
+        .oci_runtime_spec
+        .command
+        .iter()
+        .find_map(|arg| required_config_keys_from_arg(arg))
+}
+
+fn required_config_keys_from_arg(arg: &str) -> Option<String> {
+    const PREFIX: &str = "ENCLAVA_REQUIRED_CONFIG_KEYS=";
+    let value = arg.split_once(PREFIX)?.1;
+    let value = value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .trim_matches('\'');
+    normalize_required_config_keys(value)
+}
+
+fn normalize_required_config_keys(value: &str) -> Option<String> {
+    let keys = value
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.iter().any(|key| !is_valid_config_key(key)) {
+        return None;
+    }
+    Some(keys.join(","))
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn resources(
     request_cpu: &str,
     request_memory: &str,
@@ -880,6 +976,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     }
     env_vars.extend([
         value_env("CAP_CONFIG_DIR", "/state/.enclava/config"),
+        value_env("CAP_CONFIG_READY_MARKER", CAP_CONFIG_READY_MARKER),
         value_env(
             "STORAGE_OWNERSHIP_MODE",
             storage_ownership_mode(&descriptor.unlock_mode)?,
@@ -898,14 +995,19 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
         value_env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
-        value_env(
-            "ENCLAVA_INIT_UNLOCK_SOCKET",
-            "/run/enclava-unlock/unlock.sock",
-        ),
     ]);
     if !descriptor_uses_platform_managed_ssh_relay(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
     }
+    if let Some(keys) = required_config_keys_from_descriptor(descriptor) {
+        env_vars.push(value_env("CAP_CONFIG_REQUIRED_KEYS", keys));
+    }
+    env_vars.push(value_env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"));
+    env_vars.push(value_env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
+    env_vars.push(value_env(
+        "ENCLAVA_INIT_UNLOCK_SOCKET",
+        "/run/enclava-unlock/unlock.sock",
+    ));
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
         env_vars.push(value_env("KBS_RESOURCE_CA_CERT_PEM", cert));
     }
@@ -926,23 +1028,38 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             mount("unlock-socket", "/run/enclava", true),
             mount("unlock-channel", "/run/enclava-unlock", false),
         ],
-        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["MKNOD"])),
+        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["CHOWN", "MKNOD", "SYS_PTRACE"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
     }))
 }
 
-fn tenant_ingress_container(descriptor: &DeploymentDescriptor) -> Value {
-    tenant_ingress_container_for_mode(descriptor, tenant_caddy_internal_tls_enabled())
+fn tenant_ingress_container(descriptor: &DeploymentDescriptor) -> Result<Value> {
+    Ok(tenant_ingress_container_for_mode(
+        descriptor,
+        tenant_caddy_tls_mode()?,
+    ))
 }
 
 fn tenant_ingress_container_for_mode(
     descriptor: &DeploymentDescriptor,
-    internal_tls: bool,
+    tls_mode: CaddyTlsMode,
 ) -> Value {
-    let tls_port = if internal_tls {
-        CADDY_INTERNAL_TLS_PORT
-    } else {
-        CADDY_ACME_TLS_PORT
+    let tls_port = match tls_mode {
+        CaddyTlsMode::Acme | CaddyTlsMode::Dns01Broker => CADDY_ACME_TLS_PORT,
+        CaddyTlsMode::Internal => CADDY_INTERNAL_TLS_PORT,
+    };
+    let args = match tls_mode {
+        CaddyTlsMode::Dns01Broker => vec![
+            "/bin/sh".to_string(),
+            "-ec".to_string(),
+            CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT.to_string(),
+        ],
+        CaddyTlsMode::Acme | CaddyTlsMode::Internal => vec![
+            "/usr/bin/caddy".to_string(),
+            "run".to_string(),
+            "--config".to_string(),
+            "/etc/caddy/Caddyfile".to_string(),
+        ],
     };
     let (volume_mount_point, xdg_data_home, xdg_config_home, home) = (
         CADDY_INTERNAL_RUNTIME_PATH.to_string(),
@@ -955,7 +1072,7 @@ fn tenant_ingress_container_for_mode(
         "name": "tenant-ingress",
         "image": image_ref(CADDY_INGRESS_IMAGE_REPO, &descriptor.sidecars.caddy_digest),
         "command": [ENCLAVA_WAIT_EXEC_PATH],
-        "args": ["/usr/bin/caddy", "run", "--config", "/etc/caddy/Caddyfile"],
+        "args": args,
         "ports": [
             {"containerPort": tls_port, "name": "https"},
         ],
@@ -1113,7 +1230,23 @@ fn _assert_manifest_path(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::descriptor::{tests::fixed_descriptor, Capabilities, Mount, SecurityContext};
+    use crate::descriptor::{
+        tests::fixed_descriptor, Capabilities, EnvVar, Mount, SecurityContext,
+    };
+
+    fn env_entry<'a>(container: &'a Value, name: &str) -> &'a Value {
+        container
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("container env is rendered")
+            .iter()
+            .find(|entry| entry.pointer("/name") == Some(&json!(name)))
+            .unwrap_or_else(|| panic!("{name} env is rendered"))
+    }
+
+    fn env_value<'a>(container: &'a Value, name: &str) -> Option<&'a Value> {
+        env_entry(container, name).pointer("/value")
+    }
 
     #[test]
     fn invocation_pins_binary_settings_and_manifest_input() {
@@ -1265,7 +1398,8 @@ mod tests {
 
     #[test]
     fn tenant_ingress_internal_tls_manifest_uses_high_port_and_shared_runtime() {
-        let container = tenant_ingress_container_for_mode(&fixed_descriptor(), true);
+        let container =
+            tenant_ingress_container_for_mode(&fixed_descriptor(), CaddyTlsMode::Internal);
         let yaml = serde_yaml::to_string(&container).unwrap();
         assert!(yaml.contains("containerPort: 10443"));
         assert!(yaml.contains("name: XDG_DATA_HOME"));
@@ -1273,6 +1407,26 @@ mod tests {
         assert!(yaml.contains("name: XDG_CONFIG_HOME"));
         assert!(yaml.contains("value: /run/enclava/caddy-runtime/config"));
         assert!(yaml.contains("name: HOME"));
+    }
+
+    #[test]
+    fn tenant_ingress_dns01_broker_waits_for_tls_handoff_before_starting_caddy() {
+        let container =
+            tenant_ingress_container_for_mode(&fixed_descriptor(), CaddyTlsMode::Dns01Broker);
+        assert_eq!(
+            container.pointer("/command/0"),
+            Some(&json!(ENCLAVA_WAIT_EXEC_PATH))
+        );
+        assert_eq!(container.pointer("/args/0"), Some(&json!("/bin/sh")));
+        assert_eq!(container.pointer("/args/1"), Some(&json!("-ec")));
+        let script = container
+            .pointer("/args/2")
+            .and_then(Value::as_str)
+            .expect("DNS01 handoff script is rendered");
+        assert!(script.contains("tenant-ingress waiting for TLS certificate handoff"));
+        assert!(script.contains("\n  if [ -r '/run/enclava/caddy-runtime/certificates/tls.crt' ]"));
+        assert!(script.contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"));
+        assert!(script.contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
     }
 
     #[test]
@@ -1370,15 +1524,37 @@ mod tests {
             container.pointer("/securityContext/capabilities/drop/0"),
             Some(&json!("ALL"))
         );
-        assert_eq!(
-            container.pointer("/securityContext/capabilities/add/0"),
-            Some(&json!("MKNOD"))
-        );
+        let added_caps = container
+            .pointer("/securityContext/capabilities/add")
+            .and_then(Value::as_array)
+            .expect("attestation-proxy capabilities are rendered");
+        for cap in ["CHOWN", "MKNOD", "SYS_PTRACE"] {
+            assert!(
+                added_caps.iter().any(|value| value == &json!(cap)),
+                "missing {cap}"
+            );
+        }
         let manifest = serde_yaml::to_string(&container).unwrap();
         assert!(manifest.contains("name: CAP_CONFIG_DIR"));
         assert!(manifest.contains("value: /state/.enclava/config"));
+        assert_eq!(
+            env_value(&container, "CAP_CONFIG_READY_MARKER"),
+            Some(&json!(CAP_CONFIG_READY_MARKER))
+        );
         assert!(manifest.contains("name: CAP_CONFIG_FILE_GID"));
         assert!(manifest.contains("value: '10001'"));
+        assert_eq!(
+            env_value(&container, "ENCLAVA_CONTAINER_NAME"),
+            Some(&json!("attestation-proxy"))
+        );
+        assert_eq!(
+            env_value(&container, "ENCLAVA_STARTED_DIR"),
+            Some(&json!("/run/enclava/containers"))
+        );
+        assert_eq!(
+            env_value(&container, "ENCLAVA_INIT_UNLOCK_SOCKET"),
+            Some(&json!("/run/enclava-unlock/unlock.sock"))
+        );
         assert!(manifest.contains("mountPath: /state"));
         let mounts = container
             .pointer("/volumeMounts")
@@ -1395,11 +1571,50 @@ mod tests {
     }
 
     #[test]
+    fn attestation_proxy_derives_required_config_keys_from_descriptor_env() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.env.push(EnvVar {
+            name: "ENCLAVA_REQUIRED_CONFIG_KEYS".to_string(),
+            value: " FRP_SERVER_ADDR,FRP_AUTH_TOKEN ,DEBIAN_SSH_AUTHORIZED_KEYS ".to_string(),
+        });
+
+        let container = attestation_proxy_container(&descriptor).unwrap();
+
+        assert_eq!(
+            env_value(&container, "CAP_CONFIG_REQUIRED_KEYS"),
+            Some(&json!(
+                "FRP_SERVER_ADDR,FRP_AUTH_TOKEN,DEBIAN_SSH_AUTHORIZED_KEYS"
+            ))
+        );
+    }
+
+    #[test]
+    fn attestation_proxy_derives_required_config_keys_from_descriptor_command() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "ENCLAVA_REQUIRED_CONFIG_KEYS='FRP_SERVER_ADDR,FRP_AUTH_TOKEN' exec /app".to_string(),
+        ];
+
+        let container = attestation_proxy_container(&descriptor).unwrap();
+
+        assert_eq!(
+            env_value(&container, "CAP_CONFIG_REQUIRED_KEYS"),
+            Some(&json!("FRP_SERVER_ADDR,FRP_AUTH_TOKEN"))
+        );
+    }
+
+    #[test]
     fn platform_managed_ssh_relay_descriptor_renders_root_supervisor_policy_input() {
         let mut descriptor = fixed_descriptor();
         descriptor.oci_runtime_spec.command = vec![ENCLAVA_WAIT_EXEC_PATH.to_string()];
         descriptor.oci_runtime_spec.args =
             vec!["/usr/local/bin/debian-ssh-frp-entrypoint".to_string()];
+        descriptor.oci_runtime_spec.env.push(EnvVar {
+            name: "ENCLAVA_REQUIRED_CONFIG_KEYS".to_string(),
+            value: "FRP_SERVER_ADDR,FRP_AUTH_TOKEN,DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+        });
         descriptor.oci_runtime_spec.capabilities = Capabilities {
             drop: vec!["ALL".to_string()],
             add: PLATFORM_MANAGED_SSH_RELAY_CAPS
@@ -1469,6 +1684,24 @@ mod tests {
             env.iter()
                 .all(|entry| entry.pointer("/name") != Some(&json!("CAP_CONFIG_FILE_GID"))),
             "relay profile keeps managed config root-only"
+        );
+        assert_eq!(
+            env_value(&proxy, "CAP_CONFIG_READY_MARKER"),
+            Some(&json!(CAP_CONFIG_READY_MARKER))
+        );
+        assert_eq!(
+            env_value(&proxy, "CAP_CONFIG_REQUIRED_KEYS"),
+            Some(&json!(
+                "FRP_SERVER_ADDR,FRP_AUTH_TOKEN,DEBIAN_SSH_AUTHORIZED_KEYS"
+            ))
+        );
+        assert_eq!(
+            env_value(&proxy, "ENCLAVA_CONTAINER_NAME"),
+            Some(&json!("attestation-proxy"))
+        );
+        assert_eq!(
+            env_value(&proxy, "ENCLAVA_STARTED_DIR"),
+            Some(&json!("/run/enclava/containers"))
         );
 
         let volumes = cap_volumes(&descriptor);
