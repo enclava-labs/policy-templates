@@ -51,6 +51,14 @@ const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
 const CAP_CONFIG_FILE_GID: &str = "10001";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+const ROOTFUL_SUDO_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "AUDIT_WRITE",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaddyTlsMode {
@@ -860,8 +868,8 @@ fn descriptor_uses_rootful_sudo(descriptor: &DeploymentDescriptor) -> bool {
             .drop
             .iter()
             .any(|cap| cap.eq_ignore_ascii_case("ALL"))
-        && oci.capabilities.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
-        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+        && oci.capabilities.add.len() == ROOTFUL_SUDO_CAPS.len()
+        && ROOTFUL_SUDO_CAPS.iter().all(|required| {
             oci.capabilities
                 .add
                 .iter()
@@ -1786,7 +1794,7 @@ mod tests {
         });
         descriptor.oci_runtime_spec.capabilities = Capabilities {
             drop: vec!["ALL".to_string()],
-            add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+            add: ROOTFUL_SUDO_CAPS
                 .iter()
                 .map(|cap| (*cap).to_string())
                 .collect(),
@@ -1828,7 +1836,7 @@ mod tests {
             .pointer("/securityContext/capabilities/add")
             .and_then(Value::as_array)
             .expect("rootful-sudo capabilities are rendered");
-        for cap in PLATFORM_MANAGED_SSH_RELAY_CAPS {
+        for cap in ROOTFUL_SUDO_CAPS {
             assert!(
                 added_caps.iter().any(|value| value == &json!(cap)),
                 "missing {cap}"

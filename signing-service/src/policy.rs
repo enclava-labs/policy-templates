@@ -18,7 +18,14 @@ use crate::{
     TEMPLATE_ID, TEMPLATE_TEXT,
 };
 
-const ROOTFUL_SUDO_CAPS: &[&str] = &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+const ROOTFUL_SUDO_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "AUDIT_WRITE",
+];
 
 #[derive(Debug, Clone)]
 pub struct SigningKeyMaterial {
