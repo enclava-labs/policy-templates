@@ -10,12 +10,15 @@ use uuid::Uuid;
 use crate::{
     canonical::{ce_v1_bytes, ce_v1_hash},
     descriptor::{
-        descriptor_core_hash, verify_descriptor, DeploymentDescriptor, DeploymentDescriptorEnvelope,
+        descriptor_core_hash, verify_descriptor, Capabilities, DeploymentDescriptor,
+        DeploymentDescriptorEnvelope, OciRuntimeSpec,
     },
     genpolicy::GeneratedAgentPolicy,
     keyring::{find_deployer_pubkey, keyring_fingerprint, verify_keyring, OrgKeyringEnvelope},
     TEMPLATE_ID, TEMPLATE_TEXT,
 };
+
+const ROOTFUL_SUDO_CAPS: &[&str] = &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 #[derive(Debug, Clone)]
 pub struct SigningKeyMaterial {
@@ -371,17 +374,40 @@ fn validate_rego_string_slot(name: &str, value: &str) -> Result<()> {
 }
 
 fn validate_oci_security_floor(descriptor: &DeploymentDescriptor) -> Result<()> {
+    if descriptor.oci_runtime_spec.security_context.privileged {
+        bail!("descriptor security_context.privileged must be false");
+    }
     if descriptor
         .oci_runtime_spec
         .security_context
         .allow_privilege_escalation
+        && !descriptor_uses_rootful_sudo(&descriptor.oci_runtime_spec)
     {
-        bail!("descriptor security_context.allow_privilege_escalation must be false");
-    }
-    if descriptor.oci_runtime_spec.security_context.privileged {
-        bail!("descriptor security_context.privileged must be false");
+        bail!(
+            "descriptor security_context.allow_privilege_escalation requires rootful-sudo profile"
+        );
     }
     Ok(())
+}
+
+fn descriptor_uses_rootful_sudo(oci: &OciRuntimeSpec) -> bool {
+    let sec = &oci.security_context;
+    sec.run_as_user == 0
+        && sec.run_as_group == 0
+        && !sec.read_only_root_fs
+        && sec.allow_privilege_escalation
+        && !sec.privileged
+        && capabilities_match_rootful_sudo(&oci.capabilities)
+}
+
+fn capabilities_match_rootful_sudo(caps: &Capabilities) -> bool {
+    caps.drop.iter().any(|cap| cap.eq_ignore_ascii_case("ALL"))
+        && caps.add.len() == ROOTFUL_SUDO_CAPS.len()
+        && ROOTFUL_SUDO_CAPS.iter().all(|required| {
+            caps.add
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(required))
+        })
 }
 
 #[cfg(test)]
@@ -606,6 +632,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("expected_agent_policy_hash"));
+    }
+
+    #[test]
+    fn rootful_sudo_security_profile_passes_floor() {
+        let mut descriptor = descriptor_for_service();
+        descriptor.oci_runtime_spec.security_context.run_as_user = 0;
+        descriptor.oci_runtime_spec.security_context.run_as_group = 0;
+        descriptor
+            .oci_runtime_spec
+            .security_context
+            .read_only_root_fs = false;
+        descriptor
+            .oci_runtime_spec
+            .security_context
+            .allow_privilege_escalation = true;
+        descriptor.oci_runtime_spec.security_context.privileged = false;
+        descriptor.oci_runtime_spec.capabilities = Capabilities {
+            add: ROOTFUL_SUDO_CAPS
+                .iter()
+                .map(|cap| (*cap).to_string())
+                .collect(),
+            drop: vec!["ALL".to_string()],
+        };
+
+        validate_oci_security_floor(&descriptor).unwrap();
+    }
+
+    #[test]
+    fn privilege_escalation_requires_rootful_sudo_profile() {
+        let mut descriptor = descriptor_for_service();
+        descriptor
+            .oci_runtime_spec
+            .security_context
+            .allow_privilege_escalation = true;
+
+        let err = validate_oci_security_floor(&descriptor).unwrap_err();
+        assert!(err.to_string().contains("rootful-sudo profile"));
+    }
+
+    #[test]
+    fn privileged_descriptor_is_rejected() {
+        let mut descriptor = descriptor_for_service();
+        descriptor.oci_runtime_spec.security_context.privileged = true;
+
+        let err = validate_oci_security_floor(&descriptor).unwrap_err();
+        assert!(err.to_string().contains("privileged must be false"));
     }
 
     #[test]

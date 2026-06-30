@@ -839,12 +839,39 @@ fn descriptor_uses_platform_managed_ssh_relay(descriptor: &DeploymentDescriptor)
             .drop
             .iter()
             .any(|cap| cap.eq_ignore_ascii_case("ALL"))
+        && oci.capabilities.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
         && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
             oci.capabilities
                 .add
                 .iter()
                 .any(|cap| cap.eq_ignore_ascii_case(required))
         })
+}
+
+fn descriptor_uses_rootful_sudo(descriptor: &DeploymentDescriptor) -> bool {
+    let oci = &descriptor.oci_runtime_spec;
+    oci.security_context.run_as_user == 0
+        && oci.security_context.run_as_group == 0
+        && !oci.security_context.read_only_root_fs
+        && oci.security_context.allow_privilege_escalation
+        && !oci.security_context.privileged
+        && oci
+            .capabilities
+            .drop
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case("ALL"))
+        && oci.capabilities.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
+        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+            oci.capabilities
+                .add
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(required))
+        })
+}
+
+fn descriptor_uses_root_managed_config(descriptor: &DeploymentDescriptor) -> bool {
+    descriptor_uses_platform_managed_ssh_relay(descriptor)
+        || descriptor_uses_rootful_sudo(descriptor)
 }
 
 fn required_config_keys_from_descriptor(descriptor: &DeploymentDescriptor) -> Option<String> {
@@ -997,7 +1024,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         value_env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ]);
-    if !descriptor_uses_platform_managed_ssh_relay(descriptor) {
+    if !descriptor_uses_root_managed_config(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
     }
     if let Some(keys) = required_config_keys_from_descriptor(descriptor) {
@@ -1744,6 +1771,102 @@ mod tests {
                 .iter()
                 .all(|volume| volume.pointer("/name") != Some(&json!("startup"))),
             "explicit-command relay apps must not include unused startup volume"
+        );
+    }
+
+    #[test]
+    fn rootful_sudo_descriptor_renders_writable_root_policy_input() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.command = vec![ENCLAVA_WAIT_EXEC_PATH.to_string()];
+        descriptor.oci_runtime_spec.args =
+            vec!["/usr/local/bin/debian-ssh-frp-entrypoint".to_string()];
+        descriptor.oci_runtime_spec.env.push(EnvVar {
+            name: "ENCLAVA_REQUIRED_CONFIG_KEYS".to_string(),
+            value: "FRP_SERVER_ADDR,FRP_AUTH_TOKEN,DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+        });
+        descriptor.oci_runtime_spec.capabilities = Capabilities {
+            drop: vec!["ALL".to_string()],
+            add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+                .iter()
+                .map(|cap| (*cap).to_string())
+                .collect(),
+        };
+        descriptor.oci_runtime_spec.security_context = SecurityContext {
+            run_as_user: 0,
+            run_as_group: 0,
+            read_only_root_fs: false,
+            allow_privilege_escalation: true,
+            privileged: false,
+        };
+
+        let container = app_container(&descriptor);
+        assert_eq!(
+            container.pointer("/securityContext/runAsUser"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/runAsGroup"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/allowPrivilegeEscalation"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/privileged"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            container.pointer("/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
+        );
+        let added_caps = container
+            .pointer("/securityContext/capabilities/add")
+            .and_then(Value::as_array)
+            .expect("rootful-sudo capabilities are rendered");
+        for cap in PLATFORM_MANAGED_SSH_RELAY_CAPS {
+            assert!(
+                added_caps.iter().any(|value| value == &json!(cap)),
+                "missing {cap}"
+            );
+        }
+        assert!(
+            container
+                .pointer("/volumeMounts")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .all(|mount| mount.pointer("/name") != Some(&json!("startup"))),
+            "explicit-command rootful-sudo apps must not mount startup"
+        );
+
+        let proxy = attestation_proxy_container(&descriptor).unwrap();
+        let env = proxy
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("proxy env is rendered");
+        assert!(
+            env.iter()
+                .all(|entry| entry.pointer("/name") != Some(&json!("CAP_CONFIG_FILE_GID"))),
+            "rootful-sudo profile keeps managed config root-only"
+        );
+        assert_eq!(
+            env_value(&proxy, "CAP_CONFIG_REQUIRED_KEYS"),
+            Some(&json!(
+                "FRP_SERVER_ADDR,FRP_AUTH_TOKEN,DEBIAN_SSH_AUTHORIZED_KEYS"
+            ))
+        );
+
+        let volumes = cap_volumes(&descriptor);
+        assert!(
+            volumes
+                .iter()
+                .all(|volume| volume.pointer("/name") != Some(&json!("startup"))),
+            "explicit-command rootful-sudo apps must not include unused startup volume"
         );
     }
 
