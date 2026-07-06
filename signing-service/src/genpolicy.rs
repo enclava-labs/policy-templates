@@ -24,6 +24,7 @@ const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attesta
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+const ENCLAVA_LOG_RELAY_RUN_DIR: &str = "/run";
 const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
 const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
@@ -1276,6 +1277,7 @@ fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<V
             ),
         ],
         "volumeMounts": [
+            mount("log-relay-run", ENCLAVA_LOG_RELAY_RUN_DIR, false),
             mount("logs", ENCLAVA_LOG_SPOOL_DIR, true),
             mount("log-relay-tmp", ENCLAVA_LOG_RELAY_TMP_DIR, false),
         ],
@@ -1311,6 +1313,9 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, log_encryption_enabled: bool) 
         ),
     ];
     if log_encryption_enabled {
+        volumes.push(
+            json!({"name": "log-relay-run", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+        );
         volumes.push(
             json!({"name": "log-relay-tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         );
@@ -1689,31 +1694,48 @@ mod tests {
             env_value(relay, "ENCLAVA_LOG_RELAY_SPOOL_PATH"),
             Some(&json!("/run/enclava-logs/web.jsonl"))
         );
-        assert_eq!(relay.pointer("/volumeMounts/0/name"), Some(&json!("logs")));
+        assert_eq!(
+            relay.pointer("/volumeMounts/0/name"),
+            Some(&json!("log-relay-run"))
+        );
         assert_eq!(
             relay.pointer("/volumeMounts/0/mountPath"),
-            Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+            Some(&json!(ENCLAVA_LOG_RELAY_RUN_DIR))
         );
         assert_eq!(
             relay.pointer("/volumeMounts/0/readOnly"),
-            Some(&json!(true))
+            Some(&json!(false))
         );
-        assert_eq!(
-            relay.pointer("/volumeMounts/1/name"),
-            Some(&json!("log-relay-tmp"))
-        );
+        assert_eq!(relay.pointer("/volumeMounts/1/name"), Some(&json!("logs")));
         assert_eq!(
             relay.pointer("/volumeMounts/1/mountPath"),
-            Some(&json!("/tmp"))
+            Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
         );
         assert_eq!(
             relay.pointer("/volumeMounts/1/readOnly"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/2/name"),
+            Some(&json!("log-relay-tmp"))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/2/mountPath"),
+            Some(&json!("/tmp"))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/2/readOnly"),
             Some(&json!(false))
         );
         let volumes = manifest
             .pointer("/spec/volumes")
             .and_then(Value::as_array)
             .expect("volumes are present");
+        assert!(volumes.iter().any(|volume| {
+            volume.pointer("/name") == Some(&json!("log-relay-run"))
+                && volume.pointer("/emptyDir/medium") == Some(&json!("Memory"))
+                && volume.pointer("/emptyDir/sizeLimit") == Some(&json!("1Mi"))
+        }));
         assert!(volumes.iter().any(|volume| {
             volume.pointer("/name") == Some(&json!("log-relay-tmp"))
                 && volume.pointer("/emptyDir/medium") == Some(&json!("Memory"))
