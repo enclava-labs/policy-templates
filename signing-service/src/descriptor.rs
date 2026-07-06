@@ -83,6 +83,14 @@ pub struct Sidecars {
     pub caddy_digest: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEncryptionConfig {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentDescriptor {
     pub schema_version: String,

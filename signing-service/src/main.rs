@@ -87,6 +87,8 @@ struct HealthResponse {
 #[derive(Debug, Deserialize)]
 struct AgentPolicyRequest {
     descriptor: enclava_policy_signing_service::descriptor::DeploymentDescriptor,
+    #[serde(default)]
+    log_encryption: Option<enclava_policy_signing_service::descriptor::LogEncryptionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +96,8 @@ struct AgentPolicyResponse {
     agent_policy_text: String,
     agent_policy_sha256: String,
     genpolicy_version_pin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_encryption: Option<enclava_policy_signing_service::descriptor::LogEncryptionConfig>,
 }
 
 #[tokio::main]
@@ -191,12 +195,15 @@ async fn generate_agent_policy(
     if req.descriptor.schema_version != "v1" {
         return Err(AppError(anyhow!("unsupported descriptor schema_version")));
     }
-    let generated = state.genpolicy.run(&req.descriptor)?;
+    let generated = state
+        .genpolicy
+        .run_with_log_encryption(&req.descriptor, req.log_encryption.as_ref())?;
     let agent_policy_sha256 = hex::encode(Sha256::digest(generated.policy_text.as_bytes()));
     Ok(Json(AgentPolicyResponse {
         agent_policy_text: generated.policy_text,
         agent_policy_sha256,
         genpolicy_version_pin: generated.invocation.version_pin,
+        log_encryption: req.log_encryption,
     }))
 }
 
@@ -221,7 +228,9 @@ async fn sign_policy(
         .ok_or_else(|| anyhow!("legacy owner API is disabled"))?
         .require_owner(blobs.descriptor_envelope.descriptor.org_id)?;
     let inputs = verify_signing_inputs(blobs, &owner.owner_pubkey)?;
-    let generated_agent_policy = state.genpolicy.run(&inputs.descriptor)?;
+    let generated_agent_policy = state
+        .genpolicy
+        .run_with_log_encryption(&inputs.descriptor, req.log_encryption.as_ref())?;
     tracing::info!(
         genpolicy_version = %generated_agent_policy.invocation.version_pin,
         manifest_bytes = generated_agent_policy.invocation.manifest_yaml.len(),

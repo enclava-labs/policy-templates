@@ -40,6 +40,8 @@ pub struct SignRequest {
     pub platform_release_version: String,
     pub customer_descriptor_blob: String,
     pub org_keyring_blob: String,
+    #[serde(default)]
+    pub log_encryption: Option<crate::descriptor::LogEncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -503,6 +505,7 @@ mod tests {
             platform_release_version: descriptor.platform_release_version.clone(),
             customer_descriptor_blob: String::new(),
             org_keyring_blob: String::new(),
+            log_encryption: None,
         }
     }
 
@@ -521,6 +524,7 @@ mod tests {
                 .clone(),
             customer_descriptor_blob: B64.encode(serde_json::to_vec(&descriptor_envelope).unwrap()),
             org_keyring_blob: B64.encode(serde_json::to_vec(&keyring_envelope).unwrap()),
+            log_encryption: None,
         };
 
         let decoded = decode_signing_blobs(&req).unwrap();

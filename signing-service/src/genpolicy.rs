@@ -9,7 +9,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::descriptor::{Capabilities, DeploymentDescriptor, EnvVar, OciRuntimeSpec, Resources};
+use crate::descriptor::{
+    Capabilities, DeploymentDescriptor, EnvVar, LogEncryptionConfig, OciRuntimeSpec, Resources,
+};
 
 const KATA_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
 const KATA_KERNEL_PARAMS_ANNOTATION: &str = "io.katacontainers.config.hypervisor.kernel_params";
@@ -21,7 +23,9 @@ const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cl
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
-const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
+const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
+const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
 const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-proxy";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
@@ -173,7 +177,15 @@ impl GenpolicyConfig {
         &self,
         descriptor: &DeploymentDescriptor,
     ) -> Result<GenpolicyInvocation> {
-        let manifest_yaml = render_pod_manifest(descriptor)?;
+        self.build_invocation_with_log_encryption(descriptor, None)
+    }
+
+    pub fn build_invocation_with_log_encryption(
+        &self,
+        descriptor: &DeploymentDescriptor,
+        log_encryption: Option<&LogEncryptionConfig>,
+    ) -> Result<GenpolicyInvocation> {
+        let manifest_yaml = render_pod_manifest(descriptor, log_encryption)?;
         let mut args = vec![
             "-y".to_string(),
             "pod.yaml".to_string(),
@@ -194,7 +206,15 @@ impl GenpolicyConfig {
     }
 
     pub fn run(&self, descriptor: &DeploymentDescriptor) -> Result<GeneratedAgentPolicy> {
-        let invocation = self.build_invocation(descriptor)?;
+        self.run_with_log_encryption(descriptor, None)
+    }
+
+    pub fn run_with_log_encryption(
+        &self,
+        descriptor: &DeploymentDescriptor,
+        log_encryption: Option<&LogEncryptionConfig>,
+    ) -> Result<GeneratedAgentPolicy> {
+        let invocation = self.build_invocation_with_log_encryption(descriptor, log_encryption)?;
         let dir = tempfile::tempdir().context("creating genpolicy work dir")?;
         let manifest_path = dir.path().join("pod.yaml");
         std::fs::write(&manifest_path, &invocation.manifest_yaml)
@@ -611,8 +631,20 @@ fn normalized_additional_gids(group_lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
+fn render_pod_manifest(
+    descriptor: &DeploymentDescriptor,
+    log_encryption: Option<&LogEncryptionConfig>,
+) -> Result<String> {
     let pod_name = format!("{}-0", descriptor.app_name);
+    let mut containers = vec![
+        app_container(descriptor, log_encryption),
+        attestation_proxy_container(descriptor)?,
+        tenant_ingress_container(descriptor)?,
+        enclava_init_container()?,
+    ];
+    if log_encryption.is_some() {
+        containers.push(encrypted_log_relay_container(descriptor)?);
+    }
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -631,12 +663,7 @@ fn render_pod_manifest(descriptor: &DeploymentDescriptor) -> Result<String> {
             "initContainers": [
                 enclava_tools_container()?,
             ],
-            "containers": [
-                app_container(descriptor),
-                attestation_proxy_container(descriptor)?,
-                tenant_ingress_container(descriptor)?,
-                enclava_init_container()?,
-            ],
+            "containers": containers,
             "volumes": cap_volumes(descriptor),
         },
     });
@@ -951,7 +978,10 @@ fn resources(
     })
 }
 
-fn app_container(descriptor: &DeploymentDescriptor) -> Value {
+fn app_container(
+    descriptor: &DeploymentDescriptor,
+    log_encryption: Option<&LogEncryptionConfig>,
+) -> Value {
     let oci = &descriptor.oci_runtime_spec;
     let mut volume_mounts = vec![mount("enclava-tools", "/enclava-tools", true)];
     if descriptor_uses_startup_fallback(descriptor) {
@@ -964,12 +994,39 @@ fn app_container(descriptor: &DeploymentDescriptor) -> Value {
         false,
         "HostToContainer",
     ));
-    let env = with_kubernetes_service_env(
-        oci.env
-            .iter()
-            .map(|env| value_env(&env.name, &env.value))
-            .collect(),
-    );
+    if log_encryption.is_some() {
+        volume_mounts.push(mount("logs", ENCLAVA_LOG_SPOOL_DIR, false));
+    }
+    let mut env_vars: Vec<Value> = oci
+        .env
+        .iter()
+        .map(|env| value_env(&env.name, &env.value))
+        .collect();
+    if let Some(log_encryption) = log_encryption {
+        env_vars.extend([
+            value_env("ENCLAVA_LOG_ENCRYPTION_KEY_ID", &log_encryption.key_id),
+            value_env("ENCLAVA_LOG_ORG_ID", &descriptor.org_slug),
+            value_env("ENCLAVA_LOG_APP_NAME", &descriptor.app_name),
+            value_env(
+                "ENCLAVA_LOG_DEPLOYMENT_ID",
+                descriptor.deploy_id.to_string(),
+            ),
+            value_env(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+                &log_encryption.public_key_base64url,
+            ),
+            value_env(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+                &log_encryption.public_key_sha256,
+            ),
+            value_env("ENCLAVA_LOG_CONTAINER_NAME", "web"),
+            value_env(
+                "ENCLAVA_LOG_SPOOL_PATH",
+                format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
+            ),
+        ]);
+    }
+    let env = with_kubernetes_service_env(env_vars);
 
     json!({
         "name": "web",
@@ -1147,6 +1204,7 @@ fn enclava_tools_container() -> Result<Value> {
         "volumeMounts": [
             mount("enclava-tools", "/work", false),
             mount("unlock-socket", "/run/enclava", false),
+            mount("logs", ENCLAVA_LOG_SPOOL_DIR, false),
         ],
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &[])),
         "resources": resources("10m", "16Mi", "50m", "64Mi"),
@@ -1194,6 +1252,41 @@ fn enclava_init_container() -> Result<Value> {
         ],
         "securityContext": security_context(0, 0, true, true, true, caps(&["ALL"], &["$(privileged_caps)"])),
         "resources": resources("50m", "64Mi", "250m", "512Mi"),
+    }))
+}
+
+fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<Value> {
+    Ok(json!({
+        "name": "encrypted-log-relay",
+        "image": enclava_init_image()?,
+        "command": ["/usr/local/bin/enclava-log-relay"],
+        "ports": [
+            {"containerPort": ENCLAVA_LOG_RELAY_PORT, "name": "log-relay"},
+        ],
+        "env": [
+            value_env(
+                "ENCLAVA_LOG_RELAY_BIND",
+                format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
+            ),
+            value_env("ENCLAVA_LOG_RELAY_CONTAINER", "web"),
+            value_env(
+                "ENCLAVA_LOG_RELAY_SPOOL_PATH",
+                format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
+            ),
+        ],
+        "volumeMounts": [
+            mount("logs", ENCLAVA_LOG_SPOOL_DIR, true),
+        ],
+        "securityContext": security_context(0, 0, false, false, false, caps(&["ALL"], &[])),
+        "readinessProbe": {
+            "httpGet": {
+                "path": "/health",
+                "port": ENCLAVA_LOG_RELAY_PORT,
+                "scheme": "HTTP",
+            },
+            "periodSeconds": 10,
+        },
+        "resources": resources("10m", "16Mi", "50m", "64Mi"),
     }))
 }
 
@@ -1471,7 +1564,7 @@ mod tests {
     #[test]
     fn enclava_tools_manifest_is_an_init_container_like_live_cap_manifest() {
         let manifest: Value =
-            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
+            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor(), None).unwrap()).unwrap();
         let init_containers = manifest
             .pointer("/spec/initContainers")
             .and_then(Value::as_array)
@@ -1498,6 +1591,11 @@ mod tests {
                 && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
                 && mount.pointer("/readOnly") == Some(&json!(false))
         }));
+        assert!(tool_mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("logs"))
+                && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+                && mount.pointer("/readOnly") == Some(&json!(false))
+        }));
 
         let app_containers = manifest
             .pointer("/spec/containers")
@@ -1512,9 +1610,93 @@ mod tests {
     }
 
     #[test]
+    fn log_encryption_manifest_matches_live_cap_log_contract() {
+        let log_encryption = LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "logs-prod".to_string(),
+            public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+        };
+        let descriptor = fixed_descriptor();
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&descriptor, Some(&log_encryption)).unwrap())
+                .unwrap();
+        let containers = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .expect("CAP genpolicy manifest must include containers");
+        let app = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("web")))
+            .expect("workload container is present");
+        let app_env = app
+            .pointer("/env")
+            .and_then(Value::as_array)
+            .expect("workload env is present");
+        let deployment_id = descriptor.deploy_id.to_string();
+        for (name, value) in [
+            ("ENCLAVA_LOG_ENCRYPTION_KEY_ID", "logs-prod"),
+            ("ENCLAVA_LOG_ORG_ID", descriptor.org_slug.as_str()),
+            ("ENCLAVA_LOG_APP_NAME", descriptor.app_name.as_str()),
+            ("ENCLAVA_LOG_DEPLOYMENT_ID", deployment_id.as_str()),
+            (
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+                "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
+            ),
+            ("ENCLAVA_LOG_CONTAINER_NAME", "web"),
+            ("ENCLAVA_LOG_SPOOL_PATH", "/run/enclava-logs/web.jsonl"),
+        ] {
+            assert!(
+                app_env.iter().any(|entry| {
+                    entry.pointer("/name") == Some(&json!(name))
+                        && entry.pointer("/value") == Some(&json!(value))
+                }),
+                "workload env {name} must match CAP"
+            );
+        }
+        let app_mounts = app
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .expect("workload volume mounts are present");
+        assert!(app_mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("logs"))
+                && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+                && mount.pointer("/readOnly") == Some(&json!(false))
+        }));
+
+        let relay = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("encrypted-log-relay")))
+            .expect("encrypted log relay sidecar is present");
+        assert_eq!(
+            relay.pointer("/command/0"),
+            Some(&json!("/usr/local/bin/enclava-log-relay"))
+        );
+        assert_eq!(relay.pointer("/ports/0/containerPort"), Some(&json!(8082)));
+        assert_eq!(relay.pointer("/ports/0/name"), Some(&json!("log-relay")));
+        assert_eq!(
+            env_value(relay, "ENCLAVA_LOG_RELAY_SPOOL_PATH"),
+            Some(&json!("/run/enclava-logs/web.jsonl"))
+        );
+        assert_eq!(relay.pointer("/volumeMounts/0/name"), Some(&json!("logs")));
+        assert_eq!(
+            relay.pointer("/volumeMounts/0/mountPath"),
+            Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/0/readOnly"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
     fn enclava_init_env_matches_live_cap_sidecar_contract() {
         let manifest: Value =
-            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor()).unwrap()).unwrap();
+            serde_yaml::from_str(&render_pod_manifest(&fixed_descriptor(), None).unwrap()).unwrap();
         let containers = manifest
             .pointer("/spec/containers")
             .and_then(Value::as_array)
@@ -1699,7 +1881,7 @@ mod tests {
             privileged: false,
         };
 
-        let container = app_container(&descriptor);
+        let container = app_container(&descriptor, None);
         assert_eq!(
             container.pointer("/securityContext/runAsUser"),
             Some(&json!(0))
@@ -1807,7 +1989,7 @@ mod tests {
             privileged: false,
         };
 
-        let container = app_container(&descriptor);
+        let container = app_container(&descriptor, None);
         assert_eq!(
             container.pointer("/securityContext/runAsUser"),
             Some(&json!(0))
@@ -1896,7 +2078,7 @@ mod tests {
             },
         ];
 
-        let manifest = render_pod_manifest(&descriptor).unwrap();
+        let manifest = render_pod_manifest(&descriptor, None).unwrap();
 
         assert!(manifest.contains("mountPath: /state"));
         assert_eq!(manifest.matches("mountPath: /data").count(), 1);
@@ -1907,7 +2089,7 @@ mod tests {
     fn auto_unlock_descriptor_renders_auto_unlock_proxy_mode() {
         let mut descriptor = fixed_descriptor();
         descriptor.unlock_mode = "auto".to_string();
-        let manifest = render_pod_manifest(&descriptor).unwrap();
+        let manifest = render_pod_manifest(&descriptor, None).unwrap();
         assert!(manifest.contains("name: STORAGE_OWNERSHIP_MODE"));
         assert!(manifest.contains("value: auto-unlock"));
     }
@@ -1916,7 +2098,7 @@ mod tests {
     fn invalid_unlock_mode_is_rejected() {
         let mut descriptor = fixed_descriptor();
         descriptor.unlock_mode = "manual".to_string();
-        let err = render_pod_manifest(&descriptor).unwrap_err();
+        let err = render_pod_manifest(&descriptor, None).unwrap_err();
         assert!(err.to_string().contains("descriptor.unlock_mode"));
     }
 
