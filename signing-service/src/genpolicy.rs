@@ -1277,7 +1277,7 @@ fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<V
         "volumeMounts": [
             mount("logs", ENCLAVA_LOG_SPOOL_DIR, true),
         ],
-        "securityContext": security_context(0, 0, false, false, false, caps(&["ALL"], &[])),
+        "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &[])),
         "readinessProbe": {
             "httpGet": {
                 "path": "/health",
@@ -1690,6 +1690,22 @@ mod tests {
         assert_eq!(
             relay.pointer("/volumeMounts/0/readOnly"),
             Some(&json!(true))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/readOnlyRootFilesystem"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/allowPrivilegeEscalation"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/privileged"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/capabilities/drop/0"),
+            Some(&json!("ALL"))
         );
     }
 
