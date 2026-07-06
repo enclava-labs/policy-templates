@@ -24,7 +24,6 @@ const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attesta
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
-const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
 const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
 const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-proxy";
@@ -637,15 +636,12 @@ fn render_pod_manifest(
     log_encryption: Option<&LogEncryptionConfig>,
 ) -> Result<String> {
     let pod_name = format!("{}-0", descriptor.app_name);
-    let mut containers = vec![
+    let containers = vec![
         app_container(descriptor, log_encryption),
         attestation_proxy_container(descriptor)?,
         tenant_ingress_container(descriptor)?,
-        enclava_init_container()?,
+        enclava_init_container(log_encryption)?,
     ];
-    if log_encryption.is_some() {
-        containers.push(encrypted_log_relay_container(descriptor)?);
-    }
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -1212,7 +1208,45 @@ fn enclava_tools_container() -> Result<Value> {
     }))
 }
 
-fn enclava_init_container() -> Result<Value> {
+fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Result<Value> {
+    let mut env = vec![
+        value_env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
+        value_env("ENCLAVA_INIT_STAY_ALIVE", "true"),
+        value_env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
+        value_env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
+        value_env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
+        value_env(
+            "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
+            ENCLAVA_INIT_WAIT_FOR_CONTAINERS,
+        ),
+        value_env("KBS_FETCH_RETRIES", "120"),
+        value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+        value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
+    ];
+    let mut volume_mounts = vec![
+        mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
+        mount_with_propagation(
+            "tls-state-mount",
+            "/state/tls-state",
+            false,
+            "Bidirectional",
+        ),
+        mount("unlock-socket", "/run/enclava", false),
+        mount("unlock-channel", "/run/enclava-unlock", false),
+        mount("enclava-init-config", "/etc/enclava-init", true),
+    ];
+    if log_encryption.is_some() {
+        env.push(value_env(
+            "ENCLAVA_LOG_RELAY_BIND",
+            format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
+        ));
+        env.push(value_env("ENCLAVA_LOG_RELAY_CONTAINER", "web"));
+        env.push(value_env(
+            "ENCLAVA_LOG_RELAY_SPOOL_PATH",
+            format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
+        ));
+        volume_mounts.push(mount("logs", ENCLAVA_LOG_SPOOL_DIR, false));
+    }
     Ok(json!({
         "name": "enclava-init",
         "image": enclava_init_image()?,
@@ -1226,27 +1260,8 @@ fn enclava_init_container() -> Result<Value> {
             "successThreshold": 1,
             "timeoutSeconds": 2,
         },
-        "env": with_kubernetes_service_env(vec![
-            value_env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
-            value_env("ENCLAVA_INIT_STAY_ALIVE", "true"),
-            value_env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
-            value_env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
-            value_env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
-            value_env(
-                "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
-                ENCLAVA_INIT_WAIT_FOR_CONTAINERS,
-            ),
-            value_env("KBS_FETCH_RETRIES", "120"),
-            value_env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
-            value_env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
-        ]),
-        "volumeMounts": [
-            mount_with_propagation("state-mount", "/state", false, "Bidirectional"),
-            mount_with_propagation("tls-state-mount", "/state/tls-state", false, "Bidirectional"),
-            mount("unlock-socket", "/run/enclava", false),
-            mount("unlock-channel", "/run/enclava-unlock", false),
-            mount("enclava-init-config", "/etc/enclava-init", true),
-        ],
+        "env": with_kubernetes_service_env(env),
+        "volumeMounts": volume_mounts,
         "volumeDevices": [
             {"name": "state", "devicePath": "/dev/csi0"},
             {"name": "tls-state", "devicePath": "/dev/csi1"},
@@ -1256,43 +1271,7 @@ fn enclava_init_container() -> Result<Value> {
     }))
 }
 
-fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<Value> {
-    Ok(json!({
-        "name": "encrypted-log-relay",
-        "image": enclava_init_image()?,
-        "command": ["/usr/local/bin/enclava-log-relay"],
-        "ports": [
-            {"containerPort": ENCLAVA_LOG_RELAY_PORT, "name": "log-relay"},
-        ],
-        "env": [
-            value_env(
-                "ENCLAVA_LOG_RELAY_BIND",
-                format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
-            ),
-            value_env("ENCLAVA_LOG_RELAY_CONTAINER", "web"),
-            value_env(
-                "ENCLAVA_LOG_RELAY_SPOOL_PATH",
-                format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
-            ),
-        ],
-        "volumeMounts": [
-            mount("logs", ENCLAVA_LOG_SPOOL_DIR, false),
-            mount("log-relay-tmp", ENCLAVA_LOG_RELAY_TMP_DIR, false),
-        ],
-        "securityContext": security_context(10001, 10001, false, false, false, caps(&["ALL"], &[])),
-        "readinessProbe": {
-            "httpGet": {
-                "path": "/health",
-                "port": ENCLAVA_LOG_RELAY_PORT,
-                "scheme": "HTTP",
-            },
-            "periodSeconds": 10,
-        },
-        "resources": resources("10m", "16Mi", "50m", "64Mi"),
-    }))
-}
-
-fn cap_volumes(descriptor: &DeploymentDescriptor, log_encryption_enabled: bool) -> Vec<Value> {
+fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool) -> Vec<Value> {
     let mut volumes = vec![
         json!({"name": "logs", "emptyDir": {}}),
         json!({"name": "ownership-signal", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
@@ -1310,11 +1289,6 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, log_encryption_enabled: bool) 
             format!("{}-enclava-init", descriptor.app_name),
         ),
     ];
-    if log_encryption_enabled {
-        volumes.push(
-            json!({"name": "log-relay-tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
-        );
-    }
     if descriptor_uses_startup_fallback(descriptor) {
         volumes.insert(
             3,
@@ -1675,74 +1649,44 @@ mod tests {
                 && mount.pointer("/readOnly") == Some(&json!(false))
         }));
 
-        let relay = containers
-            .iter()
-            .find(|container| container.pointer("/name") == Some(&json!("encrypted-log-relay")))
-            .expect("encrypted log relay sidecar is present");
-        assert_eq!(
-            relay.pointer("/command/0"),
-            Some(&json!("/usr/local/bin/enclava-log-relay"))
+        assert!(
+            !containers
+                .iter()
+                .any(|container| container.pointer("/name") == Some(&json!("encrypted-log-relay"))),
+            "encrypted log relay must be embedded in enclava-init, not a separate sidecar"
         );
-        assert_eq!(relay.pointer("/ports/0/containerPort"), Some(&json!(8082)));
-        assert_eq!(relay.pointer("/ports/0/name"), Some(&json!("log-relay")));
+        let enclava_init = containers
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("enclava-init")))
+            .expect("enclava-init sidecar is present");
         assert_eq!(
-            env_value(relay, "ENCLAVA_LOG_RELAY_SPOOL_PATH"),
+            env_value(enclava_init, "ENCLAVA_LOG_RELAY_SPOOL_PATH"),
             Some(&json!("/run/enclava-logs/web.jsonl"))
         );
-        assert_eq!(relay.pointer("/volumeMounts/0/name"), Some(&json!("logs")));
         assert_eq!(
-            relay.pointer("/volumeMounts/0/mountPath"),
-            Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+            env_value(enclava_init, "ENCLAVA_LOG_RELAY_BIND"),
+            Some(&json!("127.0.0.1:8082"))
         );
         assert_eq!(
-            relay.pointer("/volumeMounts/0/readOnly"),
-            Some(&json!(false))
+            env_value(enclava_init, "ENCLAVA_LOG_RELAY_CONTAINER"),
+            Some(&json!("web"))
         );
-        assert_eq!(
-            relay.pointer("/volumeMounts/1/name"),
-            Some(&json!("log-relay-tmp"))
-        );
-        assert_eq!(
-            relay.pointer("/volumeMounts/1/mountPath"),
-            Some(&json!("/tmp"))
-        );
-        assert_eq!(
-            relay.pointer("/volumeMounts/1/readOnly"),
-            Some(&json!(false))
-        );
+        let init_mounts = enclava_init
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .expect("enclava-init volume mounts are present");
+        assert!(init_mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("logs"))
+                && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+                && mount.pointer("/readOnly") == Some(&json!(false))
+        }));
         let volumes = manifest
             .pointer("/spec/volumes")
             .and_then(Value::as_array)
             .expect("volumes are present");
-        assert!(volumes.iter().any(|volume| {
-            volume.pointer("/name") == Some(&json!("log-relay-tmp"))
-                && volume.pointer("/emptyDir/medium") == Some(&json!("Memory"))
-                && volume.pointer("/emptyDir/sizeLimit") == Some(&json!("1Mi"))
-        }));
-        assert_eq!(
-            relay.pointer("/securityContext/readOnlyRootFilesystem"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            relay.pointer("/securityContext/runAsUser"),
-            Some(&json!(10001))
-        );
-        assert_eq!(
-            relay.pointer("/securityContext/runAsGroup"),
-            Some(&json!(10001))
-        );
-        assert_eq!(
-            relay.pointer("/securityContext/allowPrivilegeEscalation"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            relay.pointer("/securityContext/privileged"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            relay.pointer("/securityContext/capabilities/drop/0"),
-            Some(&json!("ALL"))
-        );
+        assert!(!volumes
+            .iter()
+            .any(|volume| volume.pointer("/name") == Some(&json!("log-relay-tmp"))));
     }
 
     #[test]
