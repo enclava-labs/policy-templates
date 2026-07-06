@@ -24,6 +24,7 @@ const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attesta
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
 const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
 const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-proxy";
@@ -664,7 +665,7 @@ fn render_pod_manifest(
                 enclava_tools_container()?,
             ],
             "containers": containers,
-            "volumes": cap_volumes(descriptor),
+            "volumes": cap_volumes(descriptor, log_encryption.is_some()),
         },
     });
     serde_yaml::to_string(&pod).context("rendering genpolicy pod manifest")
@@ -1276,6 +1277,7 @@ fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<V
         ],
         "volumeMounts": [
             mount("logs", ENCLAVA_LOG_SPOOL_DIR, true),
+            mount("log-relay-tmp", ENCLAVA_LOG_RELAY_TMP_DIR, false),
         ],
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &[])),
         "readinessProbe": {
@@ -1290,7 +1292,7 @@ fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<V
     }))
 }
 
-fn cap_volumes(descriptor: &DeploymentDescriptor) -> Vec<Value> {
+fn cap_volumes(descriptor: &DeploymentDescriptor, log_encryption_enabled: bool) -> Vec<Value> {
     let mut volumes = vec![
         json!({"name": "logs", "emptyDir": {}}),
         json!({"name": "ownership-signal", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
@@ -1308,6 +1310,11 @@ fn cap_volumes(descriptor: &DeploymentDescriptor) -> Vec<Value> {
             format!("{}-enclava-init", descriptor.app_name),
         ),
     ];
+    if log_encryption_enabled {
+        volumes.push(
+            json!({"name": "log-relay-tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+        );
+    }
     if descriptor_uses_startup_fallback(descriptor) {
         volumes.insert(
             3,
@@ -1692,6 +1699,27 @@ mod tests {
             Some(&json!(true))
         );
         assert_eq!(
+            relay.pointer("/volumeMounts/1/name"),
+            Some(&json!("log-relay-tmp"))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/1/mountPath"),
+            Some(&json!("/tmp"))
+        );
+        assert_eq!(
+            relay.pointer("/volumeMounts/1/readOnly"),
+            Some(&json!(false))
+        );
+        let volumes = manifest
+            .pointer("/spec/volumes")
+            .and_then(Value::as_array)
+            .expect("volumes are present");
+        assert!(volumes.iter().any(|volume| {
+            volume.pointer("/name") == Some(&json!("log-relay-tmp"))
+                && volume.pointer("/emptyDir/medium") == Some(&json!("Memory"))
+                && volume.pointer("/emptyDir/sizeLimit") == Some(&json!("1Mi"))
+        }));
+        assert_eq!(
             relay.pointer("/securityContext/readOnlyRootFilesystem"),
             Some(&json!(true))
         );
@@ -1971,7 +1999,7 @@ mod tests {
             Some(&json!("/run/enclava/containers"))
         );
 
-        let volumes = cap_volumes(&descriptor);
+        let volumes = cap_volumes(&descriptor, false);
         assert!(
             volumes
                 .iter()
@@ -2067,7 +2095,7 @@ mod tests {
             ))
         );
 
-        let volumes = cap_volumes(&descriptor);
+        let volumes = cap_volumes(&descriptor, false);
         assert!(
             volumes
                 .iter()
