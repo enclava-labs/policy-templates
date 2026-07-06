@@ -1279,7 +1279,7 @@ fn encrypted_log_relay_container(_descriptor: &DeploymentDescriptor) -> Result<V
             mount("logs", ENCLAVA_LOG_SPOOL_DIR, false),
             mount("log-relay-tmp", ENCLAVA_LOG_RELAY_TMP_DIR, false),
         ],
-        "securityContext": security_context(0, 0, false, false, false, caps(&["ALL"], &[])),
+        "securityContext": security_context(10001, 10001, false, false, false, caps(&["ALL"], &[])),
         "readinessProbe": {
             "httpGet": {
                 "path": "/health",
@@ -1722,6 +1722,14 @@ mod tests {
         assert_eq!(
             relay.pointer("/securityContext/readOnlyRootFilesystem"),
             Some(&json!(false))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/runAsUser"),
+            Some(&json!(10001))
+        );
+        assert_eq!(
+            relay.pointer("/securityContext/runAsGroup"),
+            Some(&json!(10001))
         );
         assert_eq!(
             relay.pointer("/securityContext/allowPrivilegeEscalation"),
