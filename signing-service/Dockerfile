@@ -18,6 +18,7 @@ RUN set -eux; \
       ./opt/kata/share/defaults/kata-containers/genpolicy-settings.d
 
 FROM rust:1-bookworm AS builder
+ARG BUILD_PROFILE=debug
 WORKDIR /workspace
 
 COPY signing-service/Cargo.toml signing-service/Cargo.lock ./signing-service/
@@ -34,9 +35,18 @@ WORKDIR /workspace/signing-service
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/workspace/signing-service/target \
-    cargo build --release --locked && \
-    cp target/release/enclava-policy-signing-service /usr/local/bin/enclava-policy-signing-service && \
-    cp target/release/policy-artifact /usr/local/bin/enclava-policy-artifact
+    if [ "${BUILD_PROFILE}" = "release" ]; then \
+      cargo build --release --locked && \
+      cp target/release/enclava-policy-signing-service /usr/local/bin/enclava-policy-signing-service && \
+      cp target/release/policy-artifact /usr/local/bin/enclava-policy-artifact; \
+    elif [ "${BUILD_PROFILE}" = "debug" ]; then \
+      cargo build --locked && \
+      cp target/debug/enclava-policy-signing-service /usr/local/bin/enclava-policy-signing-service && \
+      cp target/debug/policy-artifact /usr/local/bin/enclava-policy-artifact; \
+    else \
+      echo "unsupported BUILD_PROFILE=${BUILD_PROFILE}; expected debug or release" >&2; \
+      exit 1; \
+    fi
 
 FROM debian:bookworm-slim AS runtime
 
