@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::canonical::{ce_v1_bytes, ce_v1_hash};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SignerIdentity {
     pub subject: String,
     pub issuer: String,

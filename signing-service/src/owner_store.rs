@@ -70,6 +70,15 @@ impl OwnerStore {
                 owner_pubkey BLOB NOT NULL CHECK(length(owner_pubkey) = 32),
                 occurred_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS signing_results (
+                descriptor_core_hash BLOB PRIMARY KEY NOT NULL
+                    CHECK(length(descriptor_core_hash) = 32),
+                artifact_bundle_digest BLOB NOT NULL
+                    CHECK(length(artifact_bundle_digest) = 32),
+                response_json BLOB NOT NULL,
+                created_at TEXT NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -149,6 +158,57 @@ impl OwnerStore {
     pub fn require_owner(&self, org_id: Uuid) -> Result<OwnerRecord> {
         self.get_owner(org_id)?
             .ok_or_else(|| anyhow!("org is not bootstrapped in signing-service owner DB"))
+    }
+
+    pub fn get_signing_result(&self, descriptor_core_hash: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT response_json FROM signing_results WHERE descriptor_core_hash = ?1",
+            params![descriptor_core_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Create an immutable signer result, or return the exact stored response
+    /// after a lost-response retry.
+    pub fn store_signing_result(
+        &self,
+        descriptor_core_hash: &[u8; 32],
+        artifact_bundle_digest: &[u8; 32],
+        response_json: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<u8>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT artifact_bundle_digest, response_json
+                 FROM signing_results WHERE descriptor_core_hash = ?1",
+                params![descriptor_core_hash.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_digest, stored_response)) = existing {
+            if stored_digest != artifact_bundle_digest.as_slice() {
+                bail!("descriptor hash already has a different artifact bundle digest");
+            }
+            return Ok(stored_response);
+        }
+        tx.execute(
+            "INSERT INTO signing_results
+             (descriptor_core_hash, artifact_bundle_digest, response_json, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                descriptor_core_hash.as_slice(),
+                artifact_bundle_digest.as_slice(),
+                response_json,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(response_json.to_vec())
     }
 
     pub fn rotate_owner(
@@ -258,6 +318,36 @@ mod tests {
             .bootstrap_owner(org_id, other, fixed_time())
             .unwrap_err();
         assert!(err.to_string().contains("different owner"));
+    }
+
+    #[test]
+    fn signing_result_replays_exact_bytes_and_rejects_bundle_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OwnerStore::open(dir.path().join("owners.sqlite3")).unwrap();
+        let descriptor_hash = [0x41; 32];
+        let bundle_digest = [0x42; 32];
+        let response = br#"{"signed":"exact"}"#;
+
+        assert_eq!(
+            store
+                .store_signing_result(&descriptor_hash, &bundle_digest, response, fixed_time(),)
+                .unwrap(),
+            response
+        );
+        assert_eq!(
+            store
+                .store_signing_result(
+                    &descriptor_hash,
+                    &bundle_digest,
+                    b"different retry bytes are ignored",
+                    fixed_time(),
+                )
+                .unwrap(),
+            response
+        );
+        assert!(store
+            .store_signing_result(&descriptor_hash, &[0x99; 32], response, fixed_time(),)
+            .is_err());
     }
 
     #[test]
