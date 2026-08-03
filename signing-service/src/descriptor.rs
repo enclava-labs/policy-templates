@@ -141,6 +141,8 @@ pub struct DeploymentDescriptor {
     pub sidecars: Sidecars,
     #[serde(default)]
     pub api_signing_pubkey: String,
+    #[serde(default)]
+    pub independent_verification: bool,
 
     #[serde(with = "hex_measurement")]
     pub expected_firmware_measurement: FirmwareMeasurement,
@@ -408,6 +410,9 @@ fn descriptor_records<'a>(
             descriptor.platform_release_version.as_bytes(),
         ),
     ];
+    if descriptor.independent_verification {
+        records.push(("independent_verification", b"true"));
+    }
     if include_chain_anchors {
         records.push((
             "expected_agent_policy_hash",
@@ -552,6 +557,7 @@ pub mod tests {
                 caddy_digest: "sha256:2222".to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+            independent_verification: false,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
@@ -570,6 +576,16 @@ pub mod tests {
         assert_eq!(
             hex::encode(descriptor_core_hash(&fixed_descriptor())),
             "1e1758ef9f3235eba697bb71672e69ca27f353ebffa94e7d186f33ebd39932de"
+        );
+    }
+
+    #[test]
+    fn independent_verification_descriptor_core_hash_matches_cap_vector() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.independent_verification = true;
+        assert_eq!(
+            hex::encode(descriptor_core_hash(&descriptor)),
+            "01defa6dd84c96010cc0322a903177bda834c50779eb058b1a3ed70f40c0fbd3"
         );
     }
 

@@ -1098,9 +1098,34 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         "ENCLAVA_INIT_UNLOCK_SOCKET",
         "/run/enclava-unlock/unlock.sock",
     ));
+    if descriptor.independent_verification {
+        env_vars.push(value_env(
+            "PROOF_TLS_CERT_PATH",
+            "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt",
+        ));
+    }
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
         env_vars.push(value_env("KBS_RESOURCE_CA_CERT_PEM", cert));
     }
+
+    let mut volume_mounts = vec![
+        mount("ownership-signal", "/run/ownership-signal", false),
+        mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
+        mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
+        mount("unlock-socket", "/run/enclava", false),
+    ];
+    if descriptor.independent_verification {
+        volume_mounts.extend([
+            mount_with_propagation(
+                "tls-state-mount",
+                "/run/enclava/public-tls",
+                true,
+                "HostToContainer",
+            ),
+            mount("verification-material", "/etc/enclava-verification", true),
+        ]);
+    }
+    volume_mounts.push(mount("unlock-channel", "/run/enclava-unlock", false));
 
     Ok(json!({
         "name": "attestation-proxy",
@@ -1111,13 +1136,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             {"containerPort": 8443, "name": "attestation"},
         ],
         "env": with_kubernetes_service_env(env_vars),
-        "volumeMounts": [
-            mount("ownership-signal", "/run/ownership-signal", false),
-            mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
-            mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
-            mount("unlock-socket", "/run/enclava", false),
-            mount("unlock-channel", "/run/enclava-unlock", false),
-        ],
+        "volumeMounts": volume_mounts,
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["CHOWN", "MKNOD", "SYS_PTRACE"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
     }))
@@ -1294,6 +1313,12 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool)
             3,
             config_map_volume("startup", format!("{}-startup", descriptor.app_name)),
         );
+    }
+    if descriptor.independent_verification {
+        volumes.push(config_map_volume(
+            "verification-material",
+            format!("{}-verification", descriptor.app_name),
+        ));
     }
     volumes
 }
@@ -1797,6 +1822,48 @@ mod tests {
             })
             .expect("attestation-proxy can write container-start readiness state");
         assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn independent_verification_proxy_matches_live_cap_evidence_mounts() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.independent_verification = true;
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&descriptor, None).unwrap()).unwrap();
+        let proxy = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("attestation-proxy")))
+            .unwrap();
+
+        assert_eq!(
+            env_value(proxy, "PROOF_TLS_CERT_PATH"),
+            Some(&json!(
+                "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt"
+            ))
+        );
+        let mounts = proxy
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .unwrap();
+        for (name, path) in [
+            ("tls-state-mount", "/run/enclava/public-tls"),
+            ("verification-material", "/etc/enclava-verification"),
+        ] {
+            assert!(mounts.iter().any(|mount| {
+                mount.pointer("/name") == Some(&json!(name))
+                    && mount.pointer("/mountPath") == Some(&json!(path))
+                    && mount.pointer("/readOnly") == Some(&json!(true))
+            }));
+        }
+        assert!(manifest
+            .pointer("/spec/volumes")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|volume| volume.pointer("/name") == Some(&json!("verification-material"))));
     }
 
     #[test]
