@@ -1108,7 +1108,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     if descriptor.independent_verification {
         env_vars.push(value_env(
             "PROOF_TLS_CERT_PATH",
-            "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt",
+            "/run/enclava/public-tls/certificates/tls.crt",
         ));
     }
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
@@ -1847,9 +1847,7 @@ mod tests {
 
         assert_eq!(
             env_value(proxy, "PROOF_TLS_CERT_PATH"),
-            Some(&json!(
-                "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt"
-            ))
+            Some(&json!("/run/enclava/public-tls/certificates/tls.crt"))
         );
         let mounts = proxy
             .pointer("/volumeMounts")
