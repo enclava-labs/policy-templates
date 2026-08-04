@@ -124,6 +124,13 @@ fn trustee_kbs_ca_cert_pem() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn amd_kds_base_url() -> Option<String> {
+    std::env::var("AMD_KDS_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct GenpolicyConfig {
     pub binary: PathBuf,
@@ -1053,6 +1060,14 @@ fn app_container(
 }
 
 fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Value> {
+    let amd_kds_base_url = amd_kds_base_url();
+    attestation_proxy_container_with_amd_kds_base_url(descriptor, amd_kds_base_url.as_deref())
+}
+
+fn attestation_proxy_container_with_amd_kds_base_url(
+    descriptor: &DeploymentDescriptor,
+    amd_kds_base_url: Option<&str>,
+) -> Result<Value> {
     let mut env_vars = vec![
         value_env("ATTESTATION_WORKLOAD_CONTAINER", "web"),
         field_env("ATTESTATION_POD_NAME", "metadata.name"),
@@ -1095,6 +1110,9 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     ]);
     if !descriptor_uses_root_managed_config(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
+    }
+    if let Some(url) = amd_kds_base_url {
+        env_vars.push(value_env("AMD_KDS_BASE_URL", url));
     }
     if let Some(keys) = required_config_keys_from_descriptor(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_REQUIRED_KEYS", keys));
@@ -1825,6 +1843,21 @@ mod tests {
             })
             .expect("attestation-proxy can write container-start readiness state");
         assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn attestation_proxy_policy_includes_amd_kds_relay() {
+        let container = attestation_proxy_container_with_amd_kds_base_url(
+            &fixed_descriptor(),
+            Some("http://amd-kds-relay.enclava-dev.svc.cluster.local:8080/vcek/v1"),
+        )
+        .unwrap();
+        assert_eq!(
+            env_value(&container, "AMD_KDS_BASE_URL"),
+            Some(&json!(
+                "http://amd-kds-relay.enclava-dev.svc.cluster.local:8080/vcek/v1"
+            ))
+        );
     }
 
     #[test]
