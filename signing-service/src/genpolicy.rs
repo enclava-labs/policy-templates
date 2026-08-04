@@ -1108,7 +1108,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     if descriptor.independent_verification {
         env_vars.push(value_env(
             "PROOF_TLS_CERT_PATH",
-            "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt",
+            "/run/enclava/public-tls/certificates/tls.crt",
         ));
     }
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
@@ -1122,15 +1122,11 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         mount("unlock-socket", "/run/enclava", false),
     ];
     if descriptor.independent_verification {
-        volume_mounts.extend([
-            mount_with_propagation(
-                "tls-state-mount",
-                "/run/enclava/public-tls",
-                true,
-                "HostToContainer",
-            ),
-            mount("verification-material", "/etc/enclava-verification", true),
-        ]);
+        volume_mounts.push(mount(
+            "verification-material",
+            "/etc/enclava-verification",
+            true,
+        ));
     }
     volume_mounts.push(mount("unlock-channel", "/run/enclava-unlock", false));
 
@@ -1847,24 +1843,17 @@ mod tests {
 
         assert_eq!(
             env_value(proxy, "PROOF_TLS_CERT_PATH"),
-            Some(&json!(
-                "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt"
-            ))
+            Some(&json!("/run/enclava/public-tls/certificates/tls.crt"))
         );
         let mounts = proxy
             .pointer("/volumeMounts")
             .and_then(Value::as_array)
             .unwrap();
-        for (name, path) in [
-            ("tls-state-mount", "/run/enclava/public-tls"),
-            ("verification-material", "/etc/enclava-verification"),
-        ] {
-            assert!(mounts.iter().any(|mount| {
-                mount.pointer("/name") == Some(&json!(name))
-                    && mount.pointer("/mountPath") == Some(&json!(path))
-                    && mount.pointer("/readOnly") == Some(&json!(true))
-            }));
-        }
+        assert!(mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("verification-material"))
+                && mount.pointer("/mountPath") == Some(&json!("/etc/enclava-verification"))
+                && mount.pointer("/readOnly") == Some(&json!(true))
+        }));
         assert!(manifest
             .pointer("/spec/volumes")
             .and_then(Value::as_array)
