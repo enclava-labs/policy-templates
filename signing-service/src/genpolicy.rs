@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use anyhow::{bail, Context, Result};
@@ -245,11 +245,7 @@ impl GenpolicyConfig {
             args.push(settings_dir.display().to_string());
         }
 
-        let output = Command::new(&self.binary)
-            .args(&args)
-            .current_dir(dir.path())
-            .output()
-            .with_context(|| format!("executing genpolicy binary {}", self.binary.display()))?;
+        let output = run_genpolicy(&self.binary, &args, dir.path())?;
         if !output.status.success() {
             bail!(
                 "genpolicy failed with status {}: {}",
@@ -264,6 +260,30 @@ impl GenpolicyConfig {
             invocation,
         })
     }
+}
+
+fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Output> {
+    let run = |command: &mut Command| {
+        command
+            .args(args)
+            .current_dir(work_dir)
+            .output()
+            .with_context(|| format!("executing genpolicy binary {}", binary.display()))
+    };
+    let output = run(&mut Command::new(binary))?;
+    if output.status.success()
+        || !String::from_utf8_lossy(&output.stderr).contains("UnauthorizedError")
+    {
+        return Ok(output);
+    }
+
+    let docker_dir = work_dir.join("anonymous-registry");
+    fs::create_dir_all(&docker_dir).context("creating anonymous registry config directory")?;
+    let auth_file = docker_dir.join("config.json");
+    fs::write(&auth_file, br#"{"auths":{}}"#).context("writing anonymous registry config")?;
+    run(Command::new(binary)
+        .env("REGISTRY_AUTH_FILE", &auth_file)
+        .env("DOCKER_CONFIG", &docker_dir))
 }
 
 fn prepare_cap_settings_dir(source_dir: &Path, work_dir: &Path) -> Result<PathBuf> {
@@ -1392,6 +1412,37 @@ mod tests {
     use crate::descriptor::{
         tests::fixed_descriptor, Capabilities, EnvVar, Mount, SecurityContext,
     };
+
+    #[test]
+    #[cfg(unix)]
+    fn public_registry_pull_retries_without_rejected_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempfile::tempdir().unwrap();
+        let binary = work.path().join("fake-genpolicy");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+case "$REGISTRY_AUTH_FILE" in
+  */anonymous-registry/config.json)
+    test "$(cat "$REGISTRY_AUTH_FILE")" = '{"auths":{}}'
+    test "$DOCKER_CONFIG" = "$(dirname "$REGISTRY_AUTH_FILE")"
+    printf 'anonymous policy'
+    exit 0
+    ;;
+esac
+echo UnauthorizedError >&2
+exit 101
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = run_genpolicy(&binary, &[], work.path()).unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"anonymous policy");
+    }
 
     fn env_entry<'a>(container: &'a Value, name: &str) -> &'a Value {
         container
