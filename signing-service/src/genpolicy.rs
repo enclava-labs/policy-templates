@@ -489,6 +489,13 @@ allow_cap_mount_options(p_mount, i_mount) if {
 allow_cap_mount_options(p_mount, i_mount) if {
     p_mount.type_ == "bind"
     p_mount.source == ""
+    p_mount.options == ["rbind", "rprivate", "ro"]
+    i_mount.options == ["rbind", "rslave", "ro"]
+}
+
+allow_cap_mount_options(p_mount, i_mount) if {
+    p_mount.type_ == "bind"
+    p_mount.source == ""
     p_mount.options == ["rbind", "rprivate", "rw"]
     i_mount.options == ["rbind", "rshared", "rw"]
 }
@@ -2400,6 +2407,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
         assert!(normalized.contains("allow_cap_mount_options(p_mount, i_mount)"));
         assert!(normalized.contains("allow_cap_sandbox_storage(p_storage, i_storage)"));
         assert!(normalized.contains(r#"i_mount.options == ["rbind", "rslave", "rw"]"#));
+        assert!(normalized.contains(r#"i_mount.options == ["rbind", "rslave", "ro"]"#));
         assert!(normalized.contains(r#"i_mount.options == ["rbind", "rshared", "rw"]"#));
         assert!(normalized.contains("allow_cap_storage_fs_group(p_storage, i_storage)"));
         assert!(normalized.contains("allow_cap_storage_options(p_storage, i_storage)"));
