@@ -83,6 +83,27 @@ pub struct Sidecars {
     pub caddy_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirmwareMeasurement {
+    Legacy([u8; 32]),
+    Full([u8; 48]),
+}
+
+impl FirmwareMeasurement {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Legacy(bytes) => bytes,
+            Self::Full(bytes) => bytes,
+        }
+    }
+}
+
+impl From<[u8; 32]> for FirmwareMeasurement {
+    fn from(value: [u8; 32]) -> Self {
+        Self::Legacy(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogEncryptionConfig {
     pub algorithm: String,
@@ -120,9 +141,11 @@ pub struct DeploymentDescriptor {
     pub sidecars: Sidecars,
     #[serde(default)]
     pub api_signing_pubkey: String,
+    #[serde(default)]
+    pub independent_verification: bool,
 
-    #[serde(with = "hex_bytes32")]
-    pub expected_firmware_measurement: [u8; 32],
+    #[serde(with = "hex_measurement")]
+    pub expected_firmware_measurement: FirmwareMeasurement,
     pub expected_runtime_class: String,
     pub kbs_resource_path: String,
     pub unlock_mode: String,
@@ -149,6 +172,25 @@ pub struct DeploymentDescriptorEnvelope {
     pub signing_key_id: String,
     #[serde(with = "hex_pubkey")]
     pub signing_pubkey: VerifyingKey,
+}
+
+mod hex_measurement {
+    use super::FirmwareMeasurement;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &FirmwareMeasurement, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b.as_bytes()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<FirmwareMeasurement, D::Error> {
+        use serde::de::Error;
+        let bytes = hex::decode(String::deserialize(d)?).map_err(D::Error::custom)?;
+        match bytes.len() {
+            32 => Ok(FirmwareMeasurement::Legacy(bytes.try_into().unwrap())),
+            48 => Ok(FirmwareMeasurement::Full(bytes.try_into().unwrap())),
+            len => Err(D::Error::custom(format!("len {len} != 32 or 48"))),
+        }
+    }
 }
 
 pub fn verify_descriptor<'a>(
@@ -347,7 +389,7 @@ fn descriptor_records<'a>(
         ),
         (
             "expected_firmware_measurement",
-            descriptor.expected_firmware_measurement.as_slice(),
+            descriptor.expected_firmware_measurement.as_bytes(),
         ),
         (
             "expected_runtime_class",
@@ -368,6 +410,9 @@ fn descriptor_records<'a>(
             descriptor.platform_release_version.as_bytes(),
         ),
     ];
+    if descriptor.independent_verification {
+        records.push(("independent_verification", b"true"));
+    }
     if include_chain_anchors {
         records.push((
             "expected_agent_policy_hash",
@@ -512,7 +557,8 @@ pub mod tests {
                 caddy_digest: "sha256:2222".to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-            expected_firmware_measurement: [3; 32],
+            independent_verification: false,
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
             unlock_mode: "password".to_string(),
@@ -534,6 +580,16 @@ pub mod tests {
     }
 
     #[test]
+    fn independent_verification_descriptor_core_hash_matches_cap_vector() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.independent_verification = true;
+        assert_eq!(
+            hex::encode(descriptor_core_hash(&descriptor)),
+            "01defa6dd84c96010cc0322a903177bda834c50779eb058b1a3ed70f40c0fbd3"
+        );
+    }
+
+    #[test]
     fn descriptor_json_carries_image_ref_and_digest() {
         let json = serde_json::to_string(&fixed_descriptor()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -546,6 +602,18 @@ pub mod tests {
         assert!(
             image_ref_position < image_digest_position,
             "image_ref must serialize before image_digest"
+        );
+    }
+
+    #[test]
+    fn descriptor_reader_accepts_full_snp_measurement() {
+        let descriptor = fixed_descriptor();
+        let mut value = serde_json::to_value(descriptor).unwrap();
+        value["expected_firmware_measurement"] = serde_json::Value::String("03".repeat(48));
+        let parsed: DeploymentDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            parsed.expected_firmware_measurement,
+            FirmwareMeasurement::Full([3; 48])
         );
     }
 

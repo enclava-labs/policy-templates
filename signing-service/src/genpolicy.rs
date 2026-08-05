@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 
 use anyhow::{bail, Context, Result};
@@ -124,6 +124,13 @@ fn trustee_kbs_ca_cert_pem() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn amd_kds_base_url() -> Option<String> {
+    std::env::var("AMD_KDS_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct GenpolicyConfig {
     pub binary: PathBuf,
@@ -238,11 +245,7 @@ impl GenpolicyConfig {
             args.push(settings_dir.display().to_string());
         }
 
-        let output = Command::new(&self.binary)
-            .args(&args)
-            .current_dir(dir.path())
-            .output()
-            .with_context(|| format!("executing genpolicy binary {}", self.binary.display()))?;
+        let output = run_genpolicy(&self.binary, &args, dir.path())?;
         if !output.status.success() {
             bail!(
                 "genpolicy failed with status {}: {}",
@@ -257,6 +260,28 @@ impl GenpolicyConfig {
             invocation,
         })
     }
+}
+
+fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Output> {
+    let run = |command: &mut Command| {
+        command
+            .args(args)
+            .current_dir(work_dir)
+            .output()
+            .with_context(|| format!("executing genpolicy binary {}", binary.display()))
+    };
+    let output = run(&mut Command::new(binary))?;
+    if output.status.success() {
+        return Ok(output);
+    }
+
+    let docker_dir = work_dir.join("anonymous-registry");
+    fs::create_dir_all(&docker_dir).context("creating anonymous registry config directory")?;
+    let auth_file = docker_dir.join("config.json");
+    fs::write(&auth_file, br#"{"auths":{}}"#).context("writing anonymous registry config")?;
+    run(Command::new(binary)
+        .env("REGISTRY_AUTH_FILE", &auth_file)
+        .env("DOCKER_CONFIG", &docker_dir))
 }
 
 fn prepare_cap_settings_dir(source_dir: &Path, work_dir: &Path) -> Result<PathBuf> {
@@ -484,6 +509,13 @@ allow_cap_mount_options(p_mount, i_mount) if {
     p_mount.source == ""
     p_mount.options == ["rbind", "rprivate", "rw"]
     i_mount.options == ["rbind", "rslave", "rw"]
+}
+
+allow_cap_mount_options(p_mount, i_mount) if {
+    p_mount.type_ == "bind"
+    p_mount.source == ""
+    p_mount.options == ["rbind", "rprivate", "ro"]
+    i_mount.options == ["rbind", "rslave", "ro"]
 }
 
 allow_cap_mount_options(p_mount, i_mount) if {
@@ -1046,6 +1078,14 @@ fn app_container(
 }
 
 fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Value> {
+    let amd_kds_base_url = amd_kds_base_url();
+    attestation_proxy_container_with_amd_kds_base_url(descriptor, amd_kds_base_url.as_deref())
+}
+
+fn attestation_proxy_container_with_amd_kds_base_url(
+    descriptor: &DeploymentDescriptor,
+    amd_kds_base_url: Option<&str>,
+) -> Result<Value> {
     let mut env_vars = vec![
         value_env("ATTESTATION_WORKLOAD_CONTAINER", "web"),
         field_env("ATTESTATION_POD_NAME", "metadata.name"),
@@ -1089,6 +1129,9 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
     if !descriptor_uses_root_managed_config(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
     }
+    if let Some(url) = amd_kds_base_url {
+        env_vars.push(value_env("AMD_KDS_BASE_URL", url));
+    }
     if let Some(keys) = required_config_keys_from_descriptor(descriptor) {
         env_vars.push(value_env("CAP_CONFIG_REQUIRED_KEYS", keys));
     }
@@ -1098,9 +1141,30 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
         "ENCLAVA_INIT_UNLOCK_SOCKET",
         "/run/enclava-unlock/unlock.sock",
     ));
+    if descriptor.independent_verification {
+        env_vars.push(value_env(
+            "PROOF_TLS_CERT_PATH",
+            "/run/enclava/public-tls/certificates/tls.crt",
+        ));
+    }
     if let Some(cert) = trustee_kbs_ca_cert_pem() {
         env_vars.push(value_env("KBS_RESOURCE_CA_CERT_PEM", cert));
     }
+
+    let mut volume_mounts = vec![
+        mount("ownership-signal", "/run/ownership-signal", false),
+        mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
+        mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
+        mount("unlock-socket", "/run/enclava", false),
+    ];
+    if descriptor.independent_verification {
+        volume_mounts.push(mount(
+            "verification-material",
+            "/etc/enclava-verification",
+            true,
+        ));
+    }
+    volume_mounts.push(mount("unlock-channel", "/run/enclava-unlock", false));
 
     Ok(json!({
         "name": "attestation-proxy",
@@ -1111,13 +1175,7 @@ fn attestation_proxy_container(descriptor: &DeploymentDescriptor) -> Result<Valu
             {"containerPort": 8443, "name": "attestation"},
         ],
         "env": with_kubernetes_service_env(env_vars),
-        "volumeMounts": [
-            mount("ownership-signal", "/run/ownership-signal", false),
-            mount_with_propagation("state-mount", "/data", false, "HostToContainer"),
-            mount_with_propagation("state-mount", "/state", false, "HostToContainer"),
-            mount("unlock-socket", "/run/enclava", false),
-            mount("unlock-channel", "/run/enclava-unlock", false),
-        ],
+        "volumeMounts": volume_mounts,
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["CHOWN", "MKNOD", "SYS_PTRACE"])),
         "resources": resources("100m", "128Mi", "500m", "256Mi"),
     }))
@@ -1295,6 +1353,12 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool)
             config_map_volume("startup", format!("{}-startup", descriptor.app_name)),
         );
     }
+    if descriptor.independent_verification {
+        volumes.push(config_map_volume(
+            "verification-material",
+            format!("{}-verification", descriptor.app_name),
+        ));
+    }
     volumes
 }
 
@@ -1346,6 +1410,37 @@ mod tests {
     use crate::descriptor::{
         tests::fixed_descriptor, Capabilities, EnvVar, Mount, SecurityContext,
     };
+
+    #[test]
+    #[cfg(unix)]
+    fn public_registry_pull_retries_without_rejected_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempfile::tempdir().unwrap();
+        let binary = work.path().join("fake-genpolicy");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+case "$REGISTRY_AUTH_FILE" in
+  */anonymous-registry/config.json)
+    test "$(cat "$REGISTRY_AUTH_FILE")" = '{"auths":{}}'
+    test "$DOCKER_CONFIG" = "$(dirname "$REGISTRY_AUTH_FILE")"
+    printf 'anonymous policy'
+    exit 0
+    ;;
+esac
+echo registry client failed >&2
+exit 101
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = run_genpolicy(&binary, &[], work.path()).unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"anonymous policy");
+    }
 
     fn env_entry<'a>(container: &'a Value, name: &str) -> &'a Value {
         container
@@ -1797,6 +1892,56 @@ mod tests {
             })
             .expect("attestation-proxy can write container-start readiness state");
         assert_eq!(ready_mount.pointer("/readOnly"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn attestation_proxy_policy_includes_amd_kds_relay() {
+        let container = attestation_proxy_container_with_amd_kds_base_url(
+            &fixed_descriptor(),
+            Some("http://amd-kds-relay.enclava-dev.svc.cluster.local:8080/vcek/v1"),
+        )
+        .unwrap();
+        assert_eq!(
+            env_value(&container, "AMD_KDS_BASE_URL"),
+            Some(&json!(
+                "http://amd-kds-relay.enclava-dev.svc.cluster.local:8080/vcek/v1"
+            ))
+        );
+    }
+
+    #[test]
+    fn independent_verification_proxy_matches_live_cap_evidence_mounts() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.independent_verification = true;
+        let manifest: Value =
+            serde_yaml::from_str(&render_pod_manifest(&descriptor, None).unwrap()).unwrap();
+        let proxy = manifest
+            .pointer("/spec/containers")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .find(|container| container.pointer("/name") == Some(&json!("attestation-proxy")))
+            .unwrap();
+
+        assert_eq!(
+            env_value(proxy, "PROOF_TLS_CERT_PATH"),
+            Some(&json!("/run/enclava/public-tls/certificates/tls.crt"))
+        );
+        let mounts = proxy
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(mounts.iter().any(|mount| {
+            mount.pointer("/name") == Some(&json!("verification-material"))
+                && mount.pointer("/mountPath") == Some(&json!("/etc/enclava-verification"))
+                && mount.pointer("/readOnly") == Some(&json!(true))
+        }));
+        assert!(manifest
+            .pointer("/spec/volumes")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|volume| volume.pointer("/name") == Some(&json!("verification-material"))));
     }
 
     #[test]
@@ -2333,6 +2478,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
         assert!(normalized.contains("allow_cap_mount_options(p_mount, i_mount)"));
         assert!(normalized.contains("allow_cap_sandbox_storage(p_storage, i_storage)"));
         assert!(normalized.contains(r#"i_mount.options == ["rbind", "rslave", "rw"]"#));
+        assert!(normalized.contains(r#"i_mount.options == ["rbind", "rslave", "ro"]"#));
         assert!(normalized.contains(r#"i_mount.options == ["rbind", "rshared", "rw"]"#));
         assert!(normalized.contains("allow_cap_storage_fs_group(p_storage, i_storage)"));
         assert!(normalized.contains("allow_cap_storage_options(p_storage, i_storage)"));
