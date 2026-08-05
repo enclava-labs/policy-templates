@@ -271,9 +271,7 @@ fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Outp
             .with_context(|| format!("executing genpolicy binary {}", binary.display()))
     };
     let output = run(&mut Command::new(binary))?;
-    if output.status.success()
-        || !String::from_utf8_lossy(&output.stderr).contains("UnauthorizedError")
-    {
+    if output.status.success() {
         return Ok(output);
     }
 
@@ -1431,7 +1429,7 @@ case "$REGISTRY_AUTH_FILE" in
     exit 0
     ;;
 esac
-echo UnauthorizedError >&2
+echo registry client failed >&2
 exit 101
 "#,
         )
