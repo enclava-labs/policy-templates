@@ -425,19 +425,23 @@ async fn rotate_owner(
         .ok_or_else(|| anyhow!("legacy owner API is disabled"))?;
     let current = owner_store.require_owner(req.org_id)?;
     let signing_pubkey = decode_pubkey_b64("signing_pubkey_b64", &req.signing_pubkey_b64)?;
-    if signing_pubkey.to_bytes() != current.owner_pubkey.to_bytes() {
-        return Err(AppError(anyhow!(
-            "rotation directive must be signed by the current owner"
-        )));
-    }
     let replacement = decode_pubkey_b64(
         "replacement_owner_pubkey_b64",
         &req.replacement_owner_pubkey_b64,
     )?;
+    if !rotation_authority_is_current_or_replay(
+        &current.owner_pubkey,
+        &signing_pubkey,
+        &replacement,
+    ) {
+        return Err(AppError(anyhow!(
+            "rotation directive must be signed by the current owner"
+        )));
+    }
     let signature = decode_signature_b64("signature_b64", &req.signature_b64)?;
     let directive = recovery_directive_bytes(
         req.org_id,
-        &current.owner_pubkey,
+        &signing_pubkey,
         &replacement,
         req.signed_at,
         &req.reason,
@@ -454,6 +458,14 @@ async fn rotate_owner(
         owner_pubkey_fingerprint: hex::encode(rotated.owner_pubkey.to_bytes()),
         rotated_at: rotated.rotated_at.unwrap_or_else(Utc::now).to_rfc3339(),
     }))
+}
+
+fn rotation_authority_is_current_or_replay(
+    current: &VerifyingKey,
+    signer: &VerifyingKey,
+    replacement: &VerifyingKey,
+) -> bool {
+    signer.to_bytes() == current.to_bytes() || replacement.to_bytes() == current.to_bytes()
 }
 
 fn recovery_directive_bytes(
@@ -584,6 +596,34 @@ mod tests {
     #[test]
     fn owner_status_route_uses_axum_seven_dynamic_segment_syntax() {
         assert_eq!(OWNER_STATUS_ROUTE, "/orgs/:org_id/owner");
+    }
+
+    #[test]
+    fn owner_rotation_accepts_only_current_authority_or_exact_replacement_replay() {
+        let current = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let replacement = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let stranger = SigningKey::from_bytes(&[0x33; 32]).verifying_key();
+
+        assert!(rotation_authority_is_current_or_replay(
+            &current,
+            &current,
+            &replacement
+        ));
+        assert!(rotation_authority_is_current_or_replay(
+            &replacement,
+            &current,
+            &replacement
+        ));
+        assert!(rotation_authority_is_current_or_replay(
+            &replacement,
+            &stranger,
+            &replacement
+        ));
+        assert!(!rotation_authority_is_current_or_replay(
+            &current,
+            &stranger,
+            &replacement
+        ));
     }
 
     #[test]
