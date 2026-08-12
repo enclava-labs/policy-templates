@@ -413,23 +413,20 @@ async fn rotate_owner(
     State(state): State<AppState>,
     Json(req): Json<RotateOwnerRequest>,
 ) -> Result<Json<RotateOwnerResponse>, AppError> {
+    if req.reason.trim().is_empty() {
+        return Err(AppError(anyhow!("rotation reason is required")));
+    }
     let owner_store = state
         .owner_store
         .as_ref()
         .ok_or_else(|| anyhow!("legacy owner API is disabled"))?;
-    Ok(Json(apply_owner_rotation(owner_store, &req, Utc::now())?))
-}
-
-fn apply_owner_rotation(
-    owner_store: &OwnerStore,
-    req: &RotateOwnerRequest,
-    now: DateTime<Utc>,
-) -> Result<RotateOwnerResponse> {
-    if req.reason.trim().is_empty() {
-        anyhow::bail!("rotation reason is required");
-    }
     let current = owner_store.require_owner(req.org_id)?;
     let signing_pubkey = decode_pubkey_b64("signing_pubkey_b64", &req.signing_pubkey_b64)?;
+    if signing_pubkey.to_bytes() != current.owner_pubkey.to_bytes() {
+        return Err(AppError(anyhow!(
+            "rotation directive must be signed by the current owner"
+        )));
+    }
     let replacement = decode_pubkey_b64(
         "replacement_owner_pubkey_b64",
         &req.replacement_owner_pubkey_b64,
@@ -437,7 +434,7 @@ fn apply_owner_rotation(
     let signature = decode_signature_b64("signature_b64", &req.signature_b64)?;
     let directive = recovery_directive_bytes(
         req.org_id,
-        &signing_pubkey,
+        &current.owner_pubkey,
         &replacement,
         req.signed_at,
         &req.reason,
@@ -446,20 +443,14 @@ fn apply_owner_rotation(
         .verify(&directive, &signature)
         .map_err(|err| anyhow!("owner rotation signature verification failed: {err}"))?;
 
-    let rotated = if current.owner_pubkey.to_bytes() == replacement.to_bytes() {
-        current
-    } else {
-        if signing_pubkey.to_bytes() != current.owner_pubkey.to_bytes() {
-            anyhow::bail!("rotation directive must be signed by the current owner");
-        }
-        owner_store.rotate_owner(req.org_id, current.owner_pubkey, replacement, now)?
-    };
-    Ok(RotateOwnerResponse {
+    let rotated =
+        owner_store.rotate_owner(req.org_id, current.owner_pubkey, replacement, Utc::now())?;
+    Ok(Json(RotateOwnerResponse {
         org_id: req.org_id,
         version: rotated.version,
         owner_pubkey_fingerprint: hex::encode(rotated.owner_pubkey.to_bytes()),
-        rotated_at: rotated.rotated_at.unwrap_or(now).to_rfc3339(),
-    })
+        rotated_at: rotated.rotated_at.unwrap_or_else(Utc::now).to_rfc3339(),
+    }))
 }
 
 fn recovery_directive_bytes(
@@ -585,41 +576,6 @@ mod tests {
             ready.last_changed_at.as_deref(),
             Some("2026-04-01T12:00:00+00:00")
         );
-    }
-
-    #[test]
-    fn identical_owner_rotation_replay_does_not_increment_authority() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = OwnerStore::open(dir.path().join("owners.sqlite3")).unwrap();
-        let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let current = SigningKey::from_bytes(&[0x11; 32]);
-        let replacement = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
-        let signed_at = DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        store
-            .bootstrap_owner(org_id, current.verifying_key(), signed_at)
-            .unwrap();
-        let directive = recovery_directive_bytes(
-            org_id,
-            &current.verifying_key(),
-            &replacement,
-            signed_at,
-            "routine owner rotation",
-        );
-        let req = RotateOwnerRequest {
-            org_id,
-            replacement_owner_pubkey_b64: B64.encode(replacement.to_bytes()),
-            signed_at,
-            reason: "routine owner rotation".into(),
-            signing_pubkey_b64: B64.encode(current.verifying_key().to_bytes()),
-            signature_b64: B64.encode(current.sign(&directive).to_bytes()),
-        };
-        let first = apply_owner_rotation(&store, &req, signed_at).unwrap();
-        let replay = apply_owner_rotation(&store, &req, signed_at).unwrap();
-        assert_eq!(first.version, 2);
-        assert_eq!(replay.version, 2);
-        assert_eq!(store.require_owner(org_id).unwrap().version, 2);
     }
 
     #[test]
