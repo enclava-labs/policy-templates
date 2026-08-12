@@ -27,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+// Axum 0.7 uses `:name` for dynamic path segments (`{name}` is Axum 0.8 syntax).
+const OWNER_STATUS_ROUTE: &str = "/orgs/:org_id/owner";
+
 #[derive(Clone)]
 struct AppState {
     key_material: Option<Arc<SigningKeyMaterial>>,
@@ -149,7 +152,7 @@ async fn main() -> Result<()> {
             .route("/sign", post(sign_policy))
             .route("/bootstrap-org", post(bootstrap_org))
             .route("/rotate-owner", post(rotate_owner))
-            .route("/orgs/{org_id}/owner", get(owner_status));
+            .route(OWNER_STATUS_ROUTE, get(owner_status));
     } else {
         tracing::info!(
             "legacy platform signing and owner bootstrap routes are disabled; serving /agent-policy only"
@@ -576,6 +579,11 @@ mod tests {
             ready.last_changed_at.as_deref(),
             Some("2026-04-01T12:00:00+00:00")
         );
+    }
+
+    #[test]
+    fn owner_status_route_uses_axum_seven_dynamic_segment_syntax() {
+        assert_eq!(OWNER_STATUS_ROUTE, "/orgs/:org_id/owner");
     }
 
     #[test]
