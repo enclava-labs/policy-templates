@@ -82,7 +82,7 @@ struct OwnerStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    owner_pubkey_fingerprint: Option<String>,
+    owner_pubkey_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_changed_at: Option<String>,
 }
@@ -391,7 +391,7 @@ fn owner_status_response(store: &OwnerStore, org_id: Uuid) -> Result<OwnerStatus
             org_id,
             state: "not_configured",
             version: None,
-            owner_pubkey_fingerprint: None,
+            owner_pubkey_hex: None,
             last_changed_at: None,
         });
     };
@@ -399,7 +399,7 @@ fn owner_status_response(store: &OwnerStore, org_id: Uuid) -> Result<OwnerStatus
         org_id,
         state: "ready",
         version: Some(owner.version),
-        owner_pubkey_fingerprint: Some(hex::encode(owner.owner_pubkey.to_bytes())),
+        owner_pubkey_hex: Some(hex::encode(owner.owner_pubkey.to_bytes())),
         last_changed_at: Some(
             owner
                 .rotated_at
@@ -566,7 +566,7 @@ mod tests {
         let absent = owner_status_response(&store, org_id).unwrap();
         assert_eq!(absent.state, "not_configured");
         assert_eq!(absent.version, None);
-        assert_eq!(absent.owner_pubkey_fingerprint, None);
+        assert_eq!(absent.owner_pubkey_hex, None);
 
         let owner = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
         let now = DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(ready.version, Some(1));
         let expected_fingerprint = hex::encode(owner.to_bytes());
         assert_eq!(
-            ready.owner_pubkey_fingerprint.as_deref(),
+            ready.owner_pubkey_hex.as_deref(),
             Some(expected_fingerprint.as_str())
         );
         assert_eq!(
