@@ -2,7 +2,7 @@ use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,6 +26,9 @@ use enclava_policy_signing_service::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+// Axum 0.7 uses `:name` for dynamic path segments (`{name}` is Axum 0.8 syntax).
+const OWNER_STATUS_ROUTE: &str = "/orgs/:org_id/owner";
 
 #[derive(Clone)]
 struct AppState {
@@ -73,6 +76,18 @@ struct RotateOwnerResponse {
     version: u64,
     owner_pubkey_fingerprint: String,
     rotated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OwnerStatusResponse {
+    org_id: Uuid,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_pubkey_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_changed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -136,7 +151,8 @@ async fn main() -> Result<()> {
         protected_routes = protected_routes
             .route("/sign", post(sign_policy))
             .route("/bootstrap-org", post(bootstrap_org))
-            .route("/rotate-owner", post(rotate_owner));
+            .route("/rotate-owner", post(rotate_owner))
+            .route(OWNER_STATUS_ROUTE, get(owner_status));
     } else {
         tracing::info!(
             "legacy platform signing and owner bootstrap routes are disabled; serving /agent-policy only"
@@ -361,6 +377,41 @@ async fn bootstrap_org(
     }))
 }
 
+async fn owner_status(
+    State(state): State<AppState>,
+    Path(org_id): Path<Uuid>,
+) -> Result<Json<OwnerStatusResponse>, AppError> {
+    let store = state
+        .owner_store
+        .as_ref()
+        .ok_or_else(|| anyhow!("legacy owner API is disabled"))?;
+    Ok(Json(owner_status_response(store, org_id)?))
+}
+
+fn owner_status_response(store: &OwnerStore, org_id: Uuid) -> Result<OwnerStatusResponse> {
+    let Some(owner) = store.get_owner(org_id)? else {
+        return Ok(OwnerStatusResponse {
+            org_id,
+            state: "not_configured",
+            version: None,
+            owner_pubkey_hex: None,
+            last_changed_at: None,
+        });
+    };
+    Ok(OwnerStatusResponse {
+        org_id,
+        state: "ready",
+        version: Some(owner.version),
+        owner_pubkey_hex: Some(hex::encode(owner.owner_pubkey.to_bytes())),
+        last_changed_at: Some(
+            owner
+                .rotated_at
+                .unwrap_or(owner.bootstrapped_at)
+                .to_rfc3339(),
+        ),
+    })
+}
+
 async fn rotate_owner(
     State(state): State<AppState>,
     Json(req): Json<RotateOwnerRequest>,
@@ -374,19 +425,23 @@ async fn rotate_owner(
         .ok_or_else(|| anyhow!("legacy owner API is disabled"))?;
     let current = owner_store.require_owner(req.org_id)?;
     let signing_pubkey = decode_pubkey_b64("signing_pubkey_b64", &req.signing_pubkey_b64)?;
-    if signing_pubkey.to_bytes() != current.owner_pubkey.to_bytes() {
-        return Err(AppError(anyhow!(
-            "rotation directive must be signed by the current owner"
-        )));
-    }
     let replacement = decode_pubkey_b64(
         "replacement_owner_pubkey_b64",
         &req.replacement_owner_pubkey_b64,
     )?;
+    if !rotation_authority_is_current_or_replay(
+        &current.owner_pubkey,
+        &signing_pubkey,
+        &replacement,
+    ) {
+        return Err(AppError(anyhow!(
+            "rotation directive must be signed by the current owner"
+        )));
+    }
     let signature = decode_signature_b64("signature_b64", &req.signature_b64)?;
     let directive = recovery_directive_bytes(
         req.org_id,
-        &current.owner_pubkey,
+        &signing_pubkey,
         &replacement,
         req.signed_at,
         &req.reason,
@@ -403,6 +458,14 @@ async fn rotate_owner(
         owner_pubkey_fingerprint: hex::encode(rotated.owner_pubkey.to_bytes()),
         rotated_at: rotated.rotated_at.unwrap_or_else(Utc::now).to_rfc3339(),
     }))
+}
+
+fn rotation_authority_is_current_or_replay(
+    current: &VerifyingKey,
+    signer: &VerifyingKey,
+    replacement: &VerifyingKey,
+) -> bool {
+    signer.to_bytes() == current.to_bytes() || replacement.to_bytes() == current.to_bytes()
 }
 
 fn recovery_directive_bytes(
@@ -499,6 +562,68 @@ mod tests {
         );
         let signature = current.sign(&bytes);
         current.verifying_key().verify(&bytes, &signature).unwrap();
+    }
+
+    #[test]
+    fn owner_status_distinguishes_absent_and_ready_without_private_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OwnerStore::open(dir.path().join("owners.sqlite3")).unwrap();
+        let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let absent = owner_status_response(&store, org_id).unwrap();
+        assert_eq!(absent.state, "not_configured");
+        assert_eq!(absent.version, None);
+        assert_eq!(absent.owner_pubkey_hex, None);
+
+        let owner = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let now = DateTime::parse_from_rfc3339("2026-04-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        store.bootstrap_owner(org_id, owner, now).unwrap();
+        let ready = owner_status_response(&store, org_id).unwrap();
+        assert_eq!(ready.state, "ready");
+        assert_eq!(ready.version, Some(1));
+        let expected_fingerprint = hex::encode(owner.to_bytes());
+        assert_eq!(
+            ready.owner_pubkey_hex.as_deref(),
+            Some(expected_fingerprint.as_str())
+        );
+        assert_eq!(
+            ready.last_changed_at.as_deref(),
+            Some("2026-04-01T12:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn owner_status_route_uses_axum_seven_dynamic_segment_syntax() {
+        assert_eq!(OWNER_STATUS_ROUTE, "/orgs/:org_id/owner");
+    }
+
+    #[test]
+    fn owner_rotation_accepts_only_current_authority_or_exact_replacement_replay() {
+        let current = SigningKey::from_bytes(&[0x11; 32]).verifying_key();
+        let replacement = SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let stranger = SigningKey::from_bytes(&[0x33; 32]).verifying_key();
+
+        assert!(rotation_authority_is_current_or_replay(
+            &current,
+            &current,
+            &replacement
+        ));
+        assert!(rotation_authority_is_current_or_replay(
+            &replacement,
+            &current,
+            &replacement
+        ));
+        assert!(rotation_authority_is_current_or_replay(
+            &replacement,
+            &stranger,
+            &replacement
+        ));
+        assert!(!rotation_authority_is_current_or_replay(
+            &current,
+            &stranger,
+            &replacement
+        ));
     }
 
     #[test]

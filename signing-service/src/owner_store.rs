@@ -160,16 +160,44 @@ impl OwnerStore {
     ) -> Result<OwnerRecord> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let existing: Option<(Vec<u8>, i64, String)> = tx
+        let existing: Option<(Vec<u8>, i64, String, Option<String>)> = tx
             .query_row(
-                "SELECT owner_pubkey, version, bootstrapped_at FROM owners WHERE org_id = ?1",
+                "SELECT owner_pubkey, version, bootstrapped_at, rotated_at FROM owners WHERE org_id = ?1",
                 params![org_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((current_bytes, version, bootstrapped_at)) = existing else {
+        let Some((current_bytes, version, bootstrapped_at, rotated_at)) = existing else {
             bail!("org is not bootstrapped in signing-service owner DB");
         };
+        if current_bytes == replacement.to_bytes().as_slice()
+            && expected_current.to_bytes() != replacement.to_bytes()
+        {
+            let previous_owner: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT owner_pubkey
+                       FROM owner_events
+                      WHERE org_id = ?1 AND version = ?2
+                      ORDER BY id DESC
+                      LIMIT 1",
+                    params![org_id.to_string(), version - 1],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if previous_owner.as_deref() != Some(expected_current.to_bytes().as_slice()) {
+                bail!("rotation signer is not the previous owner");
+            }
+            return Ok(OwnerRecord {
+                org_id,
+                owner_pubkey: replacement,
+                version: u64::try_from(version).map_err(|_| anyhow!("negative owner version"))?,
+                bootstrapped_at: DateTime::parse_from_rfc3339(&bootstrapped_at)?
+                    .with_timezone(&Utc),
+                rotated_at: rotated_at
+                    .map(|raw| DateTime::parse_from_rfc3339(&raw).map(|dt| dt.with_timezone(&Utc)))
+                    .transpose()?,
+            });
+        }
         if current_bytes != expected_current.to_bytes().as_slice() {
             bail!("rotation signer is not the current owner");
         }
@@ -278,5 +306,17 @@ mod tests {
             store.require_owner(org_id).unwrap().owner_pubkey.to_bytes(),
             replacement.to_bytes()
         );
+
+        let replay = store
+            .rotate_owner(org_id, owner, replacement, fixed_time())
+            .unwrap();
+        assert_eq!(replay.version, 2);
+        assert_eq!(replay.owner_pubkey.to_bytes(), replacement.to_bytes());
+
+        let stranger = SigningKey::from_bytes(&[0x33; 32]).verifying_key();
+        let err = store
+            .rotate_owner(org_id, stranger, replacement, fixed_time())
+            .unwrap_err();
+        assert!(err.to_string().contains("previous owner"));
     }
 }
