@@ -33,10 +33,10 @@ transports the signed envelope to Trustee.
 Required production env:
 
 - `SIGNING_SERVICE_BEARER_TOKEN` or `SIGNING_SERVICE_BEARER_TOKENS` - bearer
-  token(s) accepted by `/agent-policy`.
-- `ENABLE_PLATFORM_POLICY_SIGNING=false` - production mode. Legacy `/sign`,
-  `/bootstrap-org`, and `/rotate-owner` routes are not registered, and
-  customers submit their own signed policy artifact.
+  token(s) accepted by every signing and owner-registry route.
+- `ENABLE_PLATFORM_POLICY_SIGNING=1` - receipt-mode production setting. It
+  registers `/sign`, `/bootstrap-org`, and `/rotate-owner` and requires durable
+  owner state plus platform signing key material.
 - `TRUSTEE_KBS_URL` and `TRUSTEE_KBS_CA_CERT_PEM` - HTTPS Trustee KBS URL and
   CA certificate used when generating the pod manifest that genpolicy evaluates.
 
@@ -45,11 +45,9 @@ Optional local/dev env:
 - `BIND_ADDR` - defaults to `0.0.0.0:8080`.
 - `SIGNING_SERVICE_ALLOW_UNAUTHENTICATED=1` - local-only escape hatch when
   running the service without bearer auth.
-- `ENABLE_PLATFORM_POLICY_SIGNING=1` plus
-  `SIGNING_SERVICE_ENABLE_LEGACY_OWNER_API=1`, `OWNER_DB_PATH`,
-  `ALLOW_RAW_POLICY_SIGNING_KEY_B64=1`, `POLICY_SIGNING_KEY_B64`, and
-  `POLICY_SIGNING_KEY_ID` - compatibility-only platform signing mode. Do not
-  use this in production.
+- `ALLOW_RAW_POLICY_SIGNING_KEY_B64=1`, `POLICY_SIGNING_KEY_B64`, and
+  `POLICY_SIGNING_KEY_ID` - local raw-key alternative to the production key
+  provider. Do not use this in production.
 - `ALLOW_EPHEMERAL_SIGNING_KEY=1` - test-only escape hatch when no signing key
   is configured.
 - `GENPOLICY_BIN`, `GENPOLICY_VERSION_PIN`, `GENPOLICY_SETTINGS_DIR` - see
@@ -74,15 +72,15 @@ the owner SQLite database at `OWNER_DB_PATH`. The default image env sets:
 - `GENPOLICY_RULES_PATH=/etc/genpolicy/rules.rego`
 - `GENPOLICY_SETTINGS_DIR=/etc/genpolicy`
 
-Production deployments must mount durable storage at `/data` and provide
+Production receipt-mode deployments must mount durable storage at `/data`, set
+`ENABLE_PLATFORM_POLICY_SIGNING=1`, and provide
 `SIGNING_SERVICE_BEARER_TOKEN`, `OWNER_DB_PATH`, and a pinned
 `GENPOLICY_VERSION_PIN`. The image bakes Kata `genpolicy` from the
 pinned `kata-tools-static` release plus `rules.rego` and the default settings
 under `/etc/genpolicy`; override `GENPOLICY_BIN`, `GENPOLICY_RULES_PATH`, or
 `GENPOLICY_SETTINGS_DIR` only when shipping a new platform release. Do not set
-`SIGNING_SERVICE_ALLOW_UNAUTHENTICATED`, `ENABLE_PLATFORM_POLICY_SIGNING`,
-`ALLOW_RAW_POLICY_SIGNING_KEY_B64`, or `ALLOW_EPHEMERAL_SIGNING_KEY` outside
-local tests.
+`SIGNING_SERVICE_ALLOW_UNAUTHENTICATED`, `ALLOW_RAW_POLICY_SIGNING_KEY_B64`, or
+`ALLOW_EPHEMERAL_SIGNING_KEY` outside local tests.
 
 cap-test01 currently records the live Kata runtime source as
 `kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596`.
