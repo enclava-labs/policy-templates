@@ -1,2 +1,4 @@
 /signing-service/target/
 owner-state.sqlite3*
+
+.planning/debug/
