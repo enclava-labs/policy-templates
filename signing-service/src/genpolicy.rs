@@ -1337,11 +1337,13 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool)
             "tenant-ingress-caddyfile",
             format!("{}-tenant-ingress", descriptor.app_name),
         ),
-        json!({"name": "enclava-tools", "emptyDir": {}}),
+        // Match CAP's guest-memory helpers/mountpoints; logs and raw PVCs stay disk-backed.
+        // Kata does not currently forward these sizeLimit declarations as guest hard bounds.
+        json!({"name": "enclava-tools", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-socket", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-channel", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
-        json!({"name": "state-mount", "emptyDir": {}}),
-        json!({"name": "tls-state-mount", "emptyDir": {}}),
+        json!({"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+        json!({"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         config_map_volume(
             "enclava-init-config",
             format!("{}-enclava-init", descriptor.app_name),
@@ -1454,6 +1456,26 @@ exit 101
 
     fn env_value<'a>(container: &'a Value, name: &str) -> Option<&'a Value> {
         env_entry(container, name).pointer("/value")
+    }
+
+    #[test]
+    fn bootstrap_volume_backing_matches_cap_without_changing_log_storage() {
+        for logs_enabled in [false, true] {
+            let volumes = cap_volumes(&fixed_descriptor(), logs_enabled);
+            for (name, size) in [
+                ("enclava-tools", "16Mi"),
+                ("state-mount", "1Mi"),
+                ("tls-state-mount", "1Mi"),
+            ] {
+                let volume = volumes.iter().find(|v| v["name"] == name).unwrap();
+                assert_eq!(
+                    volume["emptyDir"],
+                    json!({"medium": "Memory", "sizeLimit": size})
+                );
+            }
+            let logs = volumes.iter().find(|v| v["name"] == "logs").unwrap();
+            assert_eq!(logs["emptyDir"], json!({}));
+        }
     }
 
     #[test]
