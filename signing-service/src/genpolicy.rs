@@ -1814,6 +1814,7 @@ exit 101
             .pointer("/spec/containers")
             .and_then(Value::as_array)
             .expect("CAP genpolicy manifest must include containers");
+        assert_eq!(containers.last().unwrap()["name"], "enclava-init");
         let enclava_init = containers
             .iter()
             .find(|container| container.pointer("/name") == Some(&json!("enclava-init")))
