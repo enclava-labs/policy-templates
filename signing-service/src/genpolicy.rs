@@ -255,11 +255,78 @@ impl GenpolicyConfig {
         }
         let policy_text =
             String::from_utf8(output.stdout).context("genpolicy output is not UTF-8")?;
+        let policy_text = normalize_guest_memory_mount_propagation(&policy_text)?;
         Ok(GeneratedAgentPolicy {
             policy_text: normalize_cap_generated_policy(&policy_text),
             invocation,
         })
     }
+}
+
+fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String> {
+    // Pinned genpolicy appends JSON policy_data and ignores mountPropagation
+    // for emptyDirs. Correct the five platform-owned mounts before signing;
+    // leave the Rego source, destination, type and options checks unchanged.
+    const SEPARATOR: &str = "\npolicy_data := ";
+    let (rules, json_data) = policy_text
+        .rsplit_once(SEPARATOR)
+        .context("genpolicy output missing final policy_data")?;
+    let mut data: Value =
+        serde_json::from_str(json_data).context("invalid genpolicy policy_data")?;
+    let containers = data
+        .get_mut("containers")
+        .and_then(Value::as_array_mut)
+        .context("genpolicy policy_data missing containers")?;
+    for (container_name, volume, destination, propagation) in [
+        ("web", "state-mount", "/state", "rslave"),
+        ("attestation-proxy", "state-mount", "/data", "rslave"),
+        ("attestation-proxy", "state-mount", "/state", "rslave"),
+        ("enclava-init", "state-mount", "/state", "rshared"),
+        (
+            "enclava-init",
+            "tls-state-mount",
+            "/state/tls-state",
+            "rshared",
+        ),
+    ] {
+        let matching = containers
+            .iter_mut()
+            .filter(|container| {
+                container
+                    .pointer("/OCI/Annotations/io.kubernetes.cri.container-name")
+                    .and_then(Value::as_str)
+                    == Some(container_name)
+            })
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            bail!("genpolicy platform container missing or duplicated");
+        }
+        let container = matching.into_iter().next().unwrap();
+        let mounts = container
+            .pointer_mut("/OCI/Mounts")
+            .and_then(Value::as_array_mut)
+            .context("genpolicy platform container missing mounts")?;
+        let matching = mounts
+            .iter_mut()
+            .filter(|mount| mount.get("destination").and_then(Value::as_str) == Some(destination))
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            bail!("genpolicy platform mount missing or duplicated");
+        }
+        let mount = matching.into_iter().next().unwrap();
+        let source = format!("^/run/kata-containers/sandbox/ephemeral/{volume}$");
+        if mount.get("source").and_then(Value::as_str) != Some(source.as_str())
+            || mount.get("type_").and_then(Value::as_str) != Some("bind")
+            || mount.get("options") != Some(&json!(["rbind", "rprivate", "rw"]))
+        {
+            bail!("unexpected genpolicy platform memory mount shape");
+        }
+        mount["options"] = json!(["rbind", propagation, "rw"]);
+    }
+    Ok(format!(
+        "{rules}{SEPARATOR}{}",
+        serde_json::to_string_pretty(&data)?
+    ))
 }
 
 fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Output> {
@@ -1417,6 +1484,306 @@ mod tests {
     use crate::descriptor::{
         tests::fixed_descriptor, Capabilities, EnvVar, Mount, SecurityContext,
     };
+
+    fn synthetic_memory_policy() -> String {
+        let mut containers = [
+            ("web", vec![("state-mount", "/state")]),
+            ("attestation-proxy", vec![("state-mount", "/data"), ("state-mount", "/state")]),
+            ("enclava-init", vec![("state-mount", "/state"), ("tls-state-mount", "/state/tls-state")]),
+        ].into_iter().map(|(name, mounts)| json!({
+            "OCI": {
+                "Annotations": {"io.kubernetes.cri.container-name": name},
+                "Mounts": mounts.into_iter().map(|(volume, destination)| json!({
+                    "destination": destination, "type_": "bind",
+                    "source": format!("^/run/kata-containers/sandbox/ephemeral/{volume}$"),
+                    "options": ["rbind", "rprivate", "rw"]
+                })).chain([json!({"destination": "/enclava-tools", "type_": "bind", "source": "^/run/kata-containers/sandbox/ephemeral/enclava-tools$", "options": ["rbind", "rprivate", "ro"]}),
+                    json!({"destination": "/logs", "type_": "bind", "source": "", "options": ["rbind", "rprivate", "rw"]})]).collect::<Vec<_>>()
+            }, "storages": [{"driver": "ephemeral", "source": "tmpfs"}]
+        })).collect::<Vec<_>>();
+        containers.push(json!({"OCI": {"Annotations": {"io.kubernetes.cri.container-name": "unrelated"}, "Mounts": [{"destination": "/state", "type_": "bind", "source": "/unrelated", "options": ["rbind", "rprivate", "rw"]}]}}));
+        format!(
+            "package agent_policy\nimport future.keywords.if\n\npolicy_data := {}",
+            json!({"containers": containers, "common": {"sfprefix": "", "cpath": ""}})
+        )
+    }
+
+    #[test]
+    fn memory_propagation_corrects_only_five_expected_policy_mounts() {
+        let policy = synthetic_memory_policy();
+        let corrected = normalize_guest_memory_mount_propagation(&policy).unwrap();
+        let original: Value =
+            serde_json::from_str(policy.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        let mut expected = original.clone();
+        for (container, mount, propagation) in [
+            (0, 0, "rslave"),
+            (1, 0, "rslave"),
+            (1, 1, "rslave"),
+            (2, 0, "rshared"),
+            (2, 1, "rshared"),
+        ] {
+            expected["containers"][container]["OCI"]["Mounts"][mount]["options"] =
+                json!(["rbind", propagation, "rw"]);
+        }
+        let actual: Value =
+            serde_json::from_str(corrected.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        assert_eq!(actual, expected); // Includes unchanged helper, disk and storages.
+        assert_eq!(
+            policy.split_once("\npolicy_data := ").unwrap().0,
+            corrected.split_once("\npolicy_data := ").unwrap().0
+        );
+    }
+
+    #[test]
+    fn memory_propagation_rejects_unexpected_generated_shapes() {
+        for (field, value) in [
+            (
+                "source",
+                json!("^/run/kata-containers/sandbox/ephemeral/enclava-tools$"),
+            ),
+            ("source", json!("^/arbitrary/path$")),
+            ("destination", json!("/unexpected")),
+            ("type_", json!("tmpfs")),
+            ("options", json!(["rbind", "rprivate", "ro"])),
+            ("options", json!(["rbind", "rshared", "rw"])),
+            ("options", json!(["rbind", "rprivate", "rw", "exec"])),
+        ] {
+            for (container, mount) in [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1)] {
+                let policy = synthetic_memory_policy();
+                let (rules, data) = policy.rsplit_once("\npolicy_data := ").unwrap();
+                let mut data: Value = serde_json::from_str(data).unwrap();
+                data["containers"][container]["OCI"]["Mounts"][mount][field] = value.clone();
+                assert!(normalize_guest_memory_mount_propagation(&format!(
+                    "{rules}\npolicy_data := {data}"
+                ))
+                .is_err());
+            }
+        }
+        for malformed in [
+            "package agent_policy",
+            "package agent_policy\npolicy_data := {}",
+            "package agent_policy\npolicy_data := {invalid}",
+            "package agent_policy\npolicy_data := {\"containers\": {}}",
+        ] {
+            assert!(normalize_guest_memory_mount_propagation(malformed).is_err());
+        }
+        let policy = synthetic_memory_policy();
+        assert!(normalize_guest_memory_mount_propagation(&format!("{policy}\n")).is_ok());
+        assert!(normalize_guest_memory_mount_propagation(&format!("{policy}\njunk")).is_err());
+        let (rules, data) = policy.rsplit_once("\npolicy_data := ").unwrap();
+        let mut data: Value = serde_json::from_str(data).unwrap();
+        data["containers"][0]["OCI"]["Mounts"] = json!({});
+        assert!(normalize_guest_memory_mount_propagation(&format!(
+            "{rules}\npolicy_data := {data}"
+        ))
+        .is_err());
+        for mutation in 0..4 {
+            let policy = synthetic_memory_policy();
+            let (rules, data) = policy.rsplit_once("\npolicy_data := ").unwrap();
+            let mut data: Value = serde_json::from_str(data).unwrap();
+            match mutation {
+                0 => {
+                    data["containers"].as_array_mut().unwrap().remove(0);
+                }
+                1 => {
+                    let duplicate = data["containers"][0].clone();
+                    data["containers"].as_array_mut().unwrap().push(duplicate);
+                }
+                2 => {
+                    data["containers"][0]["OCI"]["Mounts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .remove(0);
+                }
+                _ => {
+                    let duplicate = data["containers"][0]["OCI"]["Mounts"][0].clone();
+                    data["containers"][0]["OCI"]["Mounts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }
+            }
+            assert!(normalize_guest_memory_mount_propagation(&format!(
+                "{rules}\npolicy_data := {data}"
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires OPA_BIN and KATA_POLICY_RULES; optional GENPOLICY_BIN/SETTINGS runs real generator"]
+    fn memory_propagation_runtime_shapes_pass_strict_rego_checks() {
+        let opa = std::env::var("OPA_BIN").expect("OPA_BIN is required");
+        let fixture = if let Ok(binary) = std::env::var("GENPOLICY_BIN") {
+            let settings =
+                std::env::var("GENPOLICY_SETTINGS").expect("GENPOLICY_SETTINGS is required");
+            let dir = tempfile::tempdir().unwrap();
+            let containers = [
+                ("web", vec![("state-mount", "/state", "HostToContainer")]),
+                ("attestation-proxy", vec![("state-mount", "/data", "HostToContainer"), ("state-mount", "/state", "HostToContainer")]),
+                ("enclava-init", vec![("state-mount", "/state", "Bidirectional"), ("tls-state-mount", "/state/tls-state", "Bidirectional")]),
+            ].into_iter().map(|(name, mounts)| json!({
+                "name": name,
+                "image": "ghcr.io/enclava-labs/enclava-init@sha256:ede2934373ba3e4414ebe6fb358416046f41c0fb7d70dd4a9d607fa248183073",
+                "command": ["/bin/true"],
+                "volumeMounts": mounts.into_iter().map(|(name, path, propagation)| mount_with_propagation(name, path, false, propagation)).collect::<Vec<_>>()
+            })).collect::<Vec<_>>();
+            let manifest = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "synthetic-mount-check", "namespace": "synthetic"}, "spec": {
+                "containers": containers,
+                "volumes": [{"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}, {"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}]
+            }});
+            let path = dir.path().join("synthetic.yaml");
+            fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+            let args = vec![
+                "-y".to_string(),
+                path.display().to_string(),
+                "-p".to_string(),
+                format!("{settings}/rules.rego"),
+                "-j".to_string(),
+                settings,
+                "-r".to_string(),
+                "-u".to_string(),
+            ];
+            // The fixture pulls only the public test image, without inheriting
+            // local registry credentials.
+            let auth = dir.path().join("config.json");
+            fs::write(&auth, r#"{"auths":{}}"#).unwrap();
+            let output = Command::new(&binary)
+                .args(&args)
+                .current_dir(dir.path())
+                .env("DOCKER_CONFIG", dir.path())
+                .env("REGISTRY_AUTH_FILE", &auth)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "synthetic genpolicy failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        } else {
+            synthetic_memory_policy()
+        };
+        let corrected = normalize_guest_memory_mount_propagation(&fixture).unwrap();
+        // Evaluate the actual pinned check_mount through the production
+        // normalizer. This is mount-level evidence, not full CreateContainer.
+        let kata_rules = fs::read_to_string(
+            std::env::var("KATA_POLICY_RULES").expect("KATA_POLICY_RULES is required"),
+        )
+        .unwrap();
+        let rules = r#"
+default allowed := false
+allowed if {
+    p_mount := policy_data.containers[input.container].OCI.Mounts[input.mount]
+    check_mount(p_mount, input.request, "synthetic-bundle", "synthetic-sandbox")
+}
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.rego");
+        fs::write(
+            &path,
+            normalize_cap_generated_policy(&format!(
+                "{kata_rules}\n{rules}\npolicy_data := input.policy_data"
+            )),
+        )
+        .unwrap();
+        let data: Value =
+            serde_json::from_str(corrected.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        let original: Value =
+            serde_json::from_str(fixture.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        for (name, destination, propagation) in [
+            ("web", "/state", "rslave"),
+            ("attestation-proxy", "/data", "rslave"),
+            ("attestation-proxy", "/state", "rslave"),
+            ("enclava-init", "/state", "rshared"),
+            ("enclava-init", "/state/tls-state", "rshared"),
+        ] {
+            let container = data["containers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|container| {
+                    container
+                        .pointer("/OCI/Annotations/io.kubernetes.cri.container-name")
+                        .and_then(Value::as_str)
+                        == Some(name)
+                })
+                .unwrap();
+            let mount = data["containers"][container]["OCI"]["Mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|mount| mount["destination"] == destination)
+                .unwrap();
+            let mut request = data["containers"][container]["OCI"]["Mounts"][mount].clone();
+            request["options"] = json!(["rbind", propagation, "rw"]);
+            request["source"] = json!(request["source"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches('^')
+                .trim_end_matches('$'));
+            let mut cases = vec![(request.clone(), true)];
+            for (field, value) in [
+                (
+                    "options",
+                    json!([
+                        "rbind",
+                        if propagation == "rslave" {
+                            "rshared"
+                        } else {
+                            "rslave"
+                        },
+                        "rw"
+                    ]),
+                ),
+                ("options", json!(["rbind", propagation, "ro"])),
+                ("options", json!(["rbind", propagation, "rw", "exec"])),
+                (
+                    "source",
+                    json!("/run/kata-containers/sandbox/ephemeral/enclava-tools"),
+                ),
+                ("source", json!("/arbitrary/path")),
+                ("destination", json!("/unexpected")),
+                ("type_", json!("tmpfs")),
+            ] {
+                let mut invalid = request.clone();
+                invalid[field] = value;
+                cases.push((invalid, false));
+            }
+            for (request, expected) in cases {
+                // Every permitted runtime shape must fail with the original
+                // generator's rprivate data, proving the pre-fix mismatch.
+                for (policy_data, expected) in
+                    std::iter::once((&data, expected)).chain(expected.then_some((&original, false)))
+                {
+                    let input = dir.path().join("input.json");
+                    fs::write(
+                    &input,
+                    json!({"container": container, "mount": mount, "request": request, "policy_data": policy_data}).to_string(),
+                )
+                .unwrap();
+                    let output = Command::new(&opa)
+                        .args(["eval", "--v0-compatible", "--format=raw", "--data"])
+                        .arg(&path)
+                        .arg("--input")
+                        .arg(&input)
+                        .arg("data.agent_policy.allowed")
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{} {}",
+                        String::from_utf8_lossy(&output.stderr),
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    assert_eq!(
+                        String::from_utf8(output.stdout).unwrap().trim(),
+                        expected.to_string()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     #[cfg(unix)]
