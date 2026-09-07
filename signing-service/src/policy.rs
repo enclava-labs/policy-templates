@@ -563,6 +563,18 @@ mod tests {
             artifact.metadata.genpolicy_version_pin,
             "kata-containers/genpolicy@3.28.0+test"
         );
+
+        // Layout selection is authenticated policy data, not a host annotation.
+        let mut tampered = artifact.clone();
+        tampered
+            .agent_policy_text
+            .insert_str(0, "# enclava-cap-volume-layout: guest-memory-v1\n");
+        let verify_key = key_material.signing_key.verifying_key();
+        assert!(verify_signed_artifact(&tampered, &verify_key).is_err());
+        tampered.agent_policy_sha256 =
+            hex::encode(Sha256::digest(tampered.agent_policy_text.as_bytes()));
+        tampered.metadata.agent_policy_sha256 = tampered.agent_policy_sha256.clone();
+        assert!(verify_signed_artifact(&tampered, &verify_key).is_err());
     }
 
     #[test]
