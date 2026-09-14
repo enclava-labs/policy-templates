@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     canonical::{ce_v1_bytes, ce_v1_hash},
     descriptor::{
-        descriptor_core_hash, verify_descriptor, Capabilities, DeploymentDescriptor,
-        DeploymentDescriptorEnvelope, OciRuntimeSpec,
+        descriptor_core_hash, validate_unique_resource_names, verify_descriptor, Capabilities,
+        DeploymentDescriptor, DeploymentDescriptorEnvelope, OciRuntimeSpec,
     },
     genpolicy::GeneratedAgentPolicy,
     keyring::{find_deployer_pubkey, keyring_fingerprint, verify_keyring, OrgKeyringEnvelope},
@@ -142,6 +142,10 @@ pub fn verify_signing_inputs(
     let keyring = verify_keyring(&blobs.keyring_envelope, trusted_owner)?;
     let deployer = find_deployer_pubkey(keyring, &blobs.descriptor_envelope.signing_pubkey)?;
     let descriptor = verify_descriptor(&blobs.descriptor_envelope, &deployer)?;
+    // A valid signature does not make an ambiguous descriptor safe: duplicate
+    // resource names diverge between first-match shape selection and
+    // last-wins manifest serialization downstream in genpolicy.
+    validate_unique_resource_names(descriptor)?;
     let descriptor_core_hash = descriptor_core_hash(descriptor);
     Ok(VerifiedSigningInputs {
         descriptor: descriptor.clone(),
@@ -615,6 +619,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("descriptor signature"));
+    }
+
+    #[test]
+    fn duplicate_resource_names_fail_verification_even_when_signed() {
+        // The signature is valid; the descriptor itself is ambiguous (first
+        // `memory` wins shape selection, last wins manifest serialization),
+        // so verification must reject it before genpolicy runs.
+        let owner = fixed_owner_key();
+        let deployer = fixed_deployer_key();
+        let mut descriptor = descriptor_for_service();
+        descriptor.oci_runtime_spec.resources.limits = vec![
+            crate::descriptor::EnvVar {
+                name: "memory".to_string(),
+                value: "1Gi".to_string(),
+            },
+            crate::descriptor::EnvVar {
+                name: "memory".to_string(),
+                value: "128Mi".to_string(),
+            },
+        ];
+        let descriptor_envelope = signed_descriptor_envelope(descriptor);
+        let keyring = sign_keyring(&owner, fixed_keyring(&owner, &deployer));
+        let keyring_envelope_value = serde_json::to_value(&keyring).unwrap();
+        let err = verify_signing_inputs(
+            DecodedSigningBlobs {
+                descriptor_envelope,
+                keyring_envelope: keyring,
+                keyring_envelope_value,
+            },
+            &owner.verifying_key(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate resource name 'memory'"));
     }
 
     #[test]
