@@ -207,6 +207,34 @@ pub fn verify_descriptor<'a>(
     Ok(&envelope.descriptor)
 }
 
+/// Reject duplicate resource names within each descriptor resource list.
+///
+/// CAP derives the workload shape from a scalar `app.resources.memory`, so
+/// resource names are unique by construction on its render path
+/// (`cap_app_oci_runtime_spec` emits exactly one cpu/memory entry per list).
+/// The descriptor's `Vec<EnvVar>` encoding can carry duplicates where
+/// consumers disagree on the winner — genpolicy shape selection reads the
+/// FIRST `memory` limit while `ResourceMap` manifest serialization keeps the
+/// LAST — which would render a pod whose resources diverge from the policy's
+/// derived shape. Fail closed instead of resolving a winner.
+pub fn validate_unique_resource_names(descriptor: &DeploymentDescriptor) -> Result<()> {
+    fn check(entries: &[EnvVar], field: &str) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for entry in entries {
+            if !seen.insert(entry.name.as_str()) {
+                bail!(
+                    "descriptor oci_runtime_spec.resources.{field} contains duplicate resource name '{}'",
+                    entry.name
+                );
+            }
+        }
+        Ok(())
+    }
+    let resources = &descriptor.oci_runtime_spec.resources;
+    check(&resources.requests, "requests")?;
+    check(&resources.limits, "limits")
+}
+
 pub fn canonical_signer_bytes(s: &SignerIdentity) -> [u8; 32] {
     ce_v1_hash(&[
         ("subject", s.subject.as_bytes()),

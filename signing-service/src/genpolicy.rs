@@ -10,7 +10,8 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::descriptor::{
-    Capabilities, DeploymentDescriptor, EnvVar, LogEncryptionConfig, OciRuntimeSpec, Resources,
+    validate_unique_resource_names, Capabilities, DeploymentDescriptor, EnvVar,
+    LogEncryptionConfig, OciRuntimeSpec, Resources,
 };
 
 const KATA_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
@@ -18,7 +19,6 @@ const KATA_KERNEL_PARAMS_ANNOTATION: &str = "io.katacontainers.config.hypervisor
 const KATA_HYPERVISOR_CC_INIT_DATA_ANNOTATION: &str =
     "io.katacontainers.config.hypervisor.cc_init_data";
 const KATA_RUNTIME_CC_INIT_DATA_ANNOTATION: &str = "io.katacontainers.config.runtime.cc_init_data";
-const KATA_RUNTIME_HANDLER: &str = "kata-qemu-snp";
 const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
@@ -739,6 +739,11 @@ fn render_pod_manifest(
     descriptor: &DeploymentDescriptor,
     log_encryption: Option<&LogEncryptionConfig>,
 ) -> Result<String> {
+    // Duplicate resource names are ambiguous here: shape derivation reads the
+    // first `memory` limit while ResourceMap serialization keeps the last, so
+    // a duplicated name would render a manifest that disagrees with the
+    // derived shape. Reject before any shape decision or manifest output.
+    validate_unique_resource_names(descriptor)?;
     let pod_name = format!("{}-0", descriptor.app_name);
     let containers = vec![
         app_container(descriptor, log_encryption),
@@ -752,7 +757,7 @@ fn render_pod_manifest(
         "metadata": {
             "name": pod_name,
             "namespace": descriptor.namespace,
-            "annotations": cap_runtime_annotations(),
+            "annotations": cap_runtime_annotations(descriptor),
         },
         "spec": {
             "runtimeClassName": descriptor.expected_runtime_class,
@@ -771,11 +776,11 @@ fn render_pod_manifest(
     serde_yaml::to_string(&pod).context("rendering genpolicy pod manifest")
 }
 
-fn cap_runtime_annotations() -> BTreeMap<&'static str, String> {
-    BTreeMap::from([
+fn cap_runtime_annotations(descriptor: &DeploymentDescriptor) -> BTreeMap<&'static str, String> {
+    let mut annotations = BTreeMap::from([
         (
             KATA_RUNTIME_HANDLER_ANNOTATION,
-            KATA_RUNTIME_HANDLER.to_string(),
+            descriptor.expected_runtime_class.clone(),
         ),
         (
             KATA_KERNEL_PARAMS_ANNOTATION,
@@ -792,7 +797,14 @@ fn cap_runtime_annotations() -> BTreeMap<&'static str, String> {
             KATA_RUNTIME_CC_INIT_DATA_ANNOTATION,
             "enclava-dynamic-cc-init-data".to_string(),
         ),
-    ])
+    ]);
+    if is_small_shape(descriptor) {
+        annotations.insert(
+            KATA_DEFAULT_MEMORY_ANNOTATION,
+            SMALL_VM_BASELINE_MIB.to_string(),
+        );
+    }
+    annotations
 }
 
 fn image_ref(repo: &str, digest: &str) -> String {
@@ -1079,6 +1091,65 @@ fn resources(
     })
 }
 
+/// Mirrors CAP's shape derivation (manifest/shape.rs): an app memory limit
+/// below the fixed standard request selects the small workload shape, which
+/// renders 64Mi sidecar budgets and a 1024Mi Kata baseline. The generated
+/// policy must match the pod CAP actually renders, so the same derivation
+/// runs here against the descriptor's signed resource limit.
+const STANDARD_APP_REQUEST_MIB: f64 = 512.0;
+const SMALL_VM_BASELINE_MIB: &str = "1024";
+const KATA_DEFAULT_MEMORY_ANNOTATION: &str = "io.katacontainers.config.hypervisor.default_memory";
+
+fn memory_limit_mib(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return None;
+    }
+    let units = [
+        ("TiB", 1024.0 * 1024.0),
+        ("Ti", 1024.0 * 1024.0),
+        ("GiB", 1024.0),
+        ("Gi", 1024.0),
+        ("MiB", 1.0),
+        ("Mi", 1.0),
+    ];
+    let (number, multiplier) = units
+        .iter()
+        .find_map(|(suffix, multiplier)| trimmed.strip_suffix(suffix).map(|n| (n, *multiplier)))?;
+    let parsed: f64 = number.parse().ok()?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return None;
+    }
+    Some(parsed * multiplier)
+}
+
+fn app_memory_limit_mib(descriptor: &DeploymentDescriptor) -> Option<f64> {
+    descriptor
+        .oci_runtime_spec
+        .resources
+        .limits
+        .iter()
+        .find(|entry| entry.name == "memory")
+        .and_then(|entry| memory_limit_mib(&entry.value))
+}
+
+fn is_small_shape(descriptor: &DeploymentDescriptor) -> bool {
+    app_memory_limit_mib(descriptor)
+        .map(|mib| mib < STANDARD_APP_REQUEST_MIB)
+        .unwrap_or(false)
+}
+
+/// Sidecar budgets must match what CAP renders for the resolved shape: the
+/// kata agent policy checks each container's OCI memory limit against this
+/// manifest.
+fn sidecar_resources(descriptor: &DeploymentDescriptor) -> Value {
+    if is_small_shape(descriptor) {
+        resources("100m", "64Mi", "500m", "64Mi")
+    } else {
+        resources("100m", "128Mi", "500m", "256Mi")
+    }
+}
+
 fn app_container(
     descriptor: &DeploymentDescriptor,
     log_encryption: Option<&LogEncryptionConfig>,
@@ -1163,7 +1234,10 @@ fn attestation_proxy_container_with_amd_kds_base_url(
         field_env("ATTESTATION_POD_NAME", "metadata.name"),
         field_env("ATTESTATION_POD_NAMESPACE", "metadata.namespace"),
         value_env("ATTESTATION_PROFILE", "coco-sev-snp"),
-        value_env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
+        value_env(
+            "ATTESTATION_RUNTIME_CLASS",
+            descriptor.expected_runtime_class.clone(),
+        ),
         value_env("ATTESTATION_WORKLOAD_IMAGE", descriptor.image_ref.clone()),
         value_env("ATTESTATION_BIND", "127.0.0.1"),
         value_env("ATTESTATION_TLS_BIND", "0.0.0.0"),
@@ -1249,7 +1323,7 @@ fn attestation_proxy_container_with_amd_kds_base_url(
         "env": with_kubernetes_service_env(env_vars),
         "volumeMounts": volume_mounts,
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["CHOWN", "MKNOD", "SYS_PTRACE"])),
-        "resources": resources("100m", "128Mi", "500m", "256Mi"),
+        "resources": sidecar_resources(descriptor),
     }))
 }
 
@@ -1314,7 +1388,7 @@ fn tenant_ingress_container_for_mode(
             mount("unlock-socket", "/run/enclava", false),
         ],
         "securityContext": security_context(10002, 10002, false, false, false, caps(&["ALL"], &[])),
-        "resources": resources("100m", "128Mi", "500m", "256Mi"),
+        "resources": sidecar_resources(descriptor),
     })
 }
 
@@ -2005,6 +2079,160 @@ exit 101
         assert!(invocation.manifest_yaml.contains("value: '1'"));
         assert!(invocation.manifest_yaml.contains("mountPath: /data"));
         assert!(invocation.manifest_yaml.contains("name: state-mount"));
+    }
+
+    fn small_descriptor() -> DeploymentDescriptor {
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.resources = Resources {
+            requests: vec![
+                EnvVar {
+                    name: "cpu".to_string(),
+                    value: "250m".to_string(),
+                },
+                EnvVar {
+                    name: "memory".to_string(),
+                    value: "128Mi".to_string(),
+                },
+            ],
+            limits: vec![
+                EnvVar {
+                    name: "cpu".to_string(),
+                    value: "1".to_string(),
+                },
+                EnvVar {
+                    name: "memory".to_string(),
+                    value: "128Mi".to_string(),
+                },
+            ],
+        };
+        descriptor.expected_runtime_class = "kata-qemu-snp-small".to_string();
+        descriptor
+    }
+
+    #[test]
+    fn small_shape_manifest_matches_cap_rendering() {
+        let config = GenpolicyConfig {
+            binary: PathBuf::from("/opt/kata/bin/genpolicy"),
+            version_pin: "kata-containers-3.12.0".to_string(),
+            rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
+            settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
+        };
+        let descriptor = small_descriptor();
+        assert!(is_small_shape(&descriptor));
+        let invocation = config.build_invocation(&descriptor).unwrap();
+        let yaml = &invocation.manifest_yaml;
+
+        // The signed class flows through every runtime-class surface.
+        assert!(yaml.contains("runtimeClassName: kata-qemu-snp-small"));
+        assert!(yaml.contains("io.containerd.cri.runtime-handler: kata-qemu-snp-small"));
+        assert!(!yaml.contains("runtime-handler: kata-qemu-snp\n"));
+        // Kata baseline and sidecar budgets match CAP's small shape.
+        assert!(yaml.contains("io.katacontainers.config.hypervisor.default_memory: '1024'"));
+        assert!(!yaml.contains("256Mi"));
+        assert!(yaml.contains("memory: 64Mi"));
+        assert!(yaml.contains("name: ATTESTATION_RUNTIME_CLASS"));
+        assert!(yaml.contains("value: kata-qemu-snp-small"));
+    }
+
+    #[test]
+    fn standard_shape_manifest_keeps_existing_rendering() {
+        let descriptor = fixed_descriptor();
+        assert!(!is_small_shape(&descriptor));
+        // An explicit >=512Mi limit also stays standard.
+        let mut big = small_descriptor();
+        big.oci_runtime_spec.resources.limits[1].value = "1Gi".to_string();
+        big.expected_runtime_class = "kata-qemu-snp".to_string();
+        assert!(!is_small_shape(&big));
+        let annotations = cap_runtime_annotations(&big);
+        assert!(!annotations.contains_key(KATA_DEFAULT_MEMORY_ANNOTATION));
+        let container = attestation_proxy_container(&big).unwrap();
+        let yaml = serde_yaml::to_string(&container).unwrap();
+        assert!(yaml.contains("memory: 256Mi"));
+    }
+
+    fn duplicate_limits_descriptor() -> DeploymentDescriptor {
+        // Two `memory` limits: first-match shape derivation would read 1Gi
+        // (standard) while ResourceMap serialization keeps 128Mi — the exact
+        // ambiguity the validation must reject rather than resolve.
+        let mut descriptor = small_descriptor();
+        descriptor.oci_runtime_spec.resources.limits = vec![
+            EnvVar {
+                name: "memory".to_string(),
+                value: "1Gi".to_string(),
+            },
+            EnvVar {
+                name: "memory".to_string(),
+                value: "128Mi".to_string(),
+            },
+        ];
+        descriptor
+    }
+
+    #[test]
+    fn duplicate_memory_limits_are_rejected_before_rendering() {
+        let config = GenpolicyConfig {
+            binary: PathBuf::from("/opt/kata/bin/genpolicy"),
+            version_pin: "kata-containers-3.12.0".to_string(),
+            rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
+            settings_dir: None,
+        };
+        let descriptor = duplicate_limits_descriptor();
+        let err = config.build_invocation(&descriptor).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("resources.limits contains duplicate resource name 'memory'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_resource_names_are_rejected_in_requests_and_limits() {
+        // Any duplicated name in either list is ambiguous, not just `memory`.
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.resources.requests = vec![
+            EnvVar {
+                name: "cpu".to_string(),
+                value: "250m".to_string(),
+            },
+            EnvVar {
+                name: "cpu".to_string(),
+                value: "500m".to_string(),
+            },
+        ];
+        let err = render_pod_manifest(&descriptor, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("resources.requests contains duplicate resource name 'cpu'"),
+            "unexpected error: {err}"
+        );
+
+        let mut descriptor = fixed_descriptor();
+        descriptor.oci_runtime_spec.resources.limits = vec![
+            EnvVar {
+                name: "ephemeral-storage".to_string(),
+                value: "1Gi".to_string(),
+            },
+            EnvVar {
+                name: "ephemeral-storage".to_string(),
+                value: "2Gi".to_string(),
+            },
+        ];
+        let err = render_pod_manifest(&descriptor, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("resources.limits contains duplicate resource name 'ephemeral-storage'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn unique_resource_names_pass_validation() {
+        // CAP's emitted shape — one cpu + one memory per list — must stay
+        // valid; the same name appearing in BOTH requests and limits is the
+        // normal Kubernetes shape and is not a duplicate.
+        assert!(validate_unique_resource_names(&fixed_descriptor()).is_ok());
+        assert!(validate_unique_resource_names(&small_descriptor()).is_ok());
+        assert!(validate_unique_resource_names(&duplicate_limits_descriptor()).is_err());
     }
 
     #[test]
