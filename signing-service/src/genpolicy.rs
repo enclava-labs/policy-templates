@@ -1093,11 +1093,11 @@ fn resources(
 
 /// Mirrors CAP's shape derivation (manifest/shape.rs): an app memory limit
 /// below the fixed standard request selects the small workload shape, which
-/// renders 64Mi sidecar budgets and a 1024Mi Kata baseline. The generated
+/// renders standard sidecar budgets and a 1536Mi Kata baseline. The generated
 /// policy must match the pod CAP actually renders, so the same derivation
 /// runs here against the descriptor's signed resource limit.
 const STANDARD_APP_REQUEST_MIB: f64 = 512.0;
-const SMALL_VM_BASELINE_MIB: &str = "1024";
+const SMALL_VM_BASELINE_MIB: &str = "1536";
 const KATA_DEFAULT_MEMORY_ANNOTATION: &str = "io.katacontainers.config.hypervisor.default_memory";
 
 fn memory_limit_mib(value: &str) -> Option<f64> {
@@ -1142,12 +1142,11 @@ fn is_small_shape(descriptor: &DeploymentDescriptor) -> bool {
 /// Sidecar budgets must match what CAP renders for the resolved shape: the
 /// kata agent policy checks each container's OCI memory limit against this
 /// manifest.
-fn sidecar_resources(descriptor: &DeploymentDescriptor) -> Value {
-    if is_small_shape(descriptor) {
-        resources("100m", "64Mi", "500m", "64Mi")
-    } else {
-        resources("100m", "128Mi", "500m", "256Mi")
-    }
+fn sidecar_resources() -> Value {
+    // Both shapes render the same sidecar budget: the working set is fixed
+    // platform overhead that does not shrink with the app, and the
+    // attestation proxy's claim path demonstrably exceeds a reduced budget.
+    resources("100m", "128Mi", "500m", "256Mi")
 }
 
 fn app_container(
@@ -1323,7 +1322,7 @@ fn attestation_proxy_container_with_amd_kds_base_url(
         "env": with_kubernetes_service_env(env_vars),
         "volumeMounts": volume_mounts,
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &["CHOWN", "MKNOD", "SYS_PTRACE"])),
-        "resources": sidecar_resources(descriptor),
+        "resources": sidecar_resources(),
     }))
 }
 
@@ -1388,7 +1387,7 @@ fn tenant_ingress_container_for_mode(
             mount("unlock-socket", "/run/enclava", false),
         ],
         "securityContext": security_context(10002, 10002, false, false, false, caps(&["ALL"], &[])),
-        "resources": sidecar_resources(descriptor),
+        "resources": sidecar_resources(),
     })
 }
 
@@ -2126,10 +2125,10 @@ exit 101
         assert!(yaml.contains("runtimeClassName: kata-qemu-snp-small"));
         assert!(yaml.contains("io.containerd.cri.runtime-handler: kata-qemu-snp-small"));
         assert!(!yaml.contains("runtime-handler: kata-qemu-snp\n"));
-        // Kata baseline and sidecar budgets match CAP's small shape.
-        assert!(yaml.contains("io.katacontainers.config.hypervisor.default_memory: '1024'"));
-        assert!(!yaml.contains("256Mi"));
-        assert!(yaml.contains("memory: 64Mi"));
+        // Kata baseline and sidecar budgets match CAP's small shape: the
+        // 1536Mi baseline and standard sidecar budgets.
+        assert!(yaml.contains("io.katacontainers.config.hypervisor.default_memory: '1536'"));
+        assert!(yaml.contains("memory: 256Mi"));
         assert!(yaml.contains("name: ATTESTATION_RUNTIME_CLASS"));
         assert!(yaml.contains("value: kata-qemu-snp-small"));
     }
