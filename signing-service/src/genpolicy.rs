@@ -25,18 +25,20 @@ const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cl
 const SIZE_CLASS_IMAGE_REPO: &str = "index.docker.io/library/busybox";
 const SIZE_CLASS_IMAGE_DIGEST: &str =
     "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f";
-// In test builds the platform sidecar repos resolve to the pinned public
-// stand-in: genpolicy resolves every manifest image over the registry, and the
-// size-class test must run without private-registry credentials. Production
-// builds keep the real platform repos.
-#[cfg(not(test))]
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
-#[cfg(test)]
-const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = SIZE_CLASS_IMAGE_REPO;
-#[cfg(not(test))]
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
-#[cfg(test)]
-const CADDY_INGRESS_IMAGE_REPO: &str = SIZE_CLASS_IMAGE_REPO;
+
+// genpolicy resolves every manifest image over the registry, so test builds swap the
+// private platform sidecar repos for the pinned public stand-in at the use site (the
+// size-class test must run without private-registry credentials). The production
+// literals above stay the single source and are pinned by a dedicated test.
+fn sidecar_image_repo(repo: &str) -> &str {
+    if cfg!(test) {
+        SIZE_CLASS_IMAGE_REPO
+    } else {
+        repo
+    }
+}
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
@@ -1330,7 +1332,7 @@ fn attestation_proxy_container_with_amd_kds_base_url(
 
     Ok(json!({
         "name": "attestation-proxy",
-        "image": image_ref(&attestation_proxy_image_repo(), &descriptor.sidecars.attestation_proxy_digest),
+        "image": image_ref(sidecar_image_repo(&attestation_proxy_image_repo()), &descriptor.sidecars.attestation_proxy_digest),
         "command": ["/attestation-proxy"],
         "ports": [
             {"containerPort": 8081, "name": "attest-http"},
@@ -1380,7 +1382,7 @@ fn tenant_ingress_container_for_mode(
 
     json!({
         "name": "tenant-ingress",
-        "image": image_ref(CADDY_INGRESS_IMAGE_REPO, &descriptor.sidecars.caddy_digest),
+        "image": image_ref(sidecar_image_repo(CADDY_INGRESS_IMAGE_REPO), &descriptor.sidecars.caddy_digest),
         "command": [ENCLAVA_WAIT_EXEC_PATH],
         "args": args,
         "ports": [
@@ -2071,11 +2073,13 @@ exit 101
             .manifest_yaml
             .contains("image: ghcr.io/enclava-labs/demo@sha256:aaaa"));
         assert!(invocation.manifest_yaml.contains(&format!(
-            "image: {DEFAULT_ATTESTATION_PROXY_IMAGE_REPO}@sha256:1111"
+            "image: {}@sha256:1111",
+            sidecar_image_repo(DEFAULT_ATTESTATION_PROXY_IMAGE_REPO)
         )));
-        assert!(invocation
-            .manifest_yaml
-            .contains(&format!("image: {CADDY_INGRESS_IMAGE_REPO}@sha256:2222")));
+        assert!(invocation.manifest_yaml.contains(&format!(
+            "image: {}@sha256:2222",
+            sidecar_image_repo(CADDY_INGRESS_IMAGE_REPO)
+        )));
         assert!(!invocation.manifest_yaml.contains("ghcr.io/enclava-ai/"));
         assert!(invocation
             .manifest_yaml
@@ -3174,37 +3178,65 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     #[test]
     fn generated_policy_size_class_stays_within_the_deploy_budget() {
+        // Skip only when the generator binary itself is absent (dev workstations):
+        // missing settings, broken config, or an explicitly configured GENPOLICY_BIN
+        // are real failures and must not be masked as a skip.
+        if std::env::var_os("GENPOLICY_BIN").is_none()
+            && matches!(
+                std::process::Command::new("genpolicy").arg("--help").output(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound
+            )
+        {
+            eprintln!("skipping size-class check: genpolicy binary not installed");
+            return;
+        }
         let config = GenpolicyConfig::from_env();
-        let generated = match config.run(&size_class_descriptor()) {
-            Ok(generated) => generated,
-            // Skip only when no binary is installed at all (dev workstations);
-            // an explicit GENPOLICY_BIN or any other failure is a hard failure.
-            Err(err)
-                if std::env::var_os("GENPOLICY_BIN").is_none()
-                    && err.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-                    }) =>
-            {
-                eprintln!("skipping size-class check: genpolicy binary not installed");
-                return;
-            }
-            Err(err) => panic!("genpolicy run failed: {err:#}"),
+        let descriptor = size_class_descriptor();
+        let log_encryption = LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "logs-size-class".to_string(),
+            public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
         };
-        let size = generated.policy_text.len();
-        eprintln!("generated policy size class: {size} bytes");
-        assert!(
-            size <= GENERATED_POLICY_SIZE_CLASS_MAX_BYTES,
-            "genpolicy output grew to {size} bytes (bound {}); the deploy-side caps are sized \
-             to this policy class — coordinate the caps before raising this bound",
-            GENERATED_POLICY_SIZE_CLASS_MAX_BYTES
+        // Both production generation entry points (main.rs): plain and log-encrypted.
+        let sizes = [
+            config.run(&descriptor),
+            config.run_with_log_encryption(&descriptor, Some(&log_encryption)),
+        ]
+        .map(|result| {
+            result
+                .unwrap_or_else(|err| panic!("genpolicy run failed: {err:#}"))
+                .policy_text
+                .len()
+        });
+        for size in sizes {
+            eprintln!("generated policy size class: {size} bytes");
+            assert!(
+                size <= GENERATED_POLICY_SIZE_CLASS_MAX_BYTES,
+                "genpolicy output grew to {size} bytes (bound {}); the deploy-side caps are sized \
+                 to this policy class — coordinate the caps before raising this bound",
+                GENERATED_POLICY_SIZE_CLASS_MAX_BYTES
+            );
+            assert!(
+                size >= GENERATED_POLICY_SIZE_CLASS_MIN_BYTES,
+                "genpolicy output shrank to {size} bytes (bound {}); imploded generator output is \
+                 as surprising as growth — verify the generation shape before adjusting this bound",
+                GENERATED_POLICY_SIZE_CLASS_MIN_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn platform_sidecar_repo_constants_stay_pinned() {
+        // The cfg(test) stand-in swap at the use site must never hide drift in the
+        // production repo strings — no other test sees them.
+        assert_eq!(
+            DEFAULT_ATTESTATION_PROXY_IMAGE_REPO,
+            "ghcr.io/enclava-labs/attestation-proxy"
         );
-        assert!(
-            size >= GENERATED_POLICY_SIZE_CLASS_MIN_BYTES,
-            "genpolicy output shrank to {size} bytes (bound {}); imploded generator output is \
-             as surprising as growth — verify the generation shape before adjusting this bound",
-            GENERATED_POLICY_SIZE_CLASS_MIN_BYTES
+        assert_eq!(
+            CADDY_INGRESS_IMAGE_REPO,
+            "ghcr.io/enclava-labs/caddy-ingress"
         );
     }
 }
