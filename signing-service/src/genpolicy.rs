@@ -20,8 +20,23 @@ const KATA_HYPERVISOR_CC_INIT_DATA_ANNOTATION: &str =
     "io.katacontainers.config.hypervisor.cc_init_data";
 const KATA_RUNTIME_CC_INIT_DATA_ANNOTATION: &str = "io.katacontainers.config.runtime.cc_init_data";
 const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
+// Tiny pinned public image used wherever tests need a registry-resolvable ref
+// (content-addressed: stable forever, anonymous pulls fine).
+const SIZE_CLASS_IMAGE_REPO: &str = "index.docker.io/library/busybox";
+const SIZE_CLASS_IMAGE_DIGEST: &str =
+    "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f";
+// In test builds the platform sidecar repos resolve to the pinned public
+// stand-in: genpolicy resolves every manifest image over the registry, and the
+// size-class test must run without private-registry credentials. Production
+// builds keep the real platform repos.
+#[cfg(not(test))]
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
+#[cfg(test)]
+const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = SIZE_CLASS_IMAGE_REPO;
+#[cfg(not(test))]
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
+#[cfg(test)]
+const CADDY_INGRESS_IMAGE_REPO: &str = SIZE_CLASS_IMAGE_REPO;
 const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
@@ -822,10 +837,12 @@ fn storage_ownership_mode(unlock_mode: &str) -> Result<&'static str> {
 fn enclava_init_image() -> Result<String> {
     let image = match std::env::var("ENCLAVA_INIT_IMAGE") {
         Ok(image) => image,
-        Err(_err) if cfg!(test) => {
-            "ghcr.io/enclava-labs/enclava-init@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+        // Test default must be a publicly resolvable pinned ref: genpolicy resolves
+        // every manifest image over the registry, including in the size-class test.
+        Err(_err) if cfg!(test) => format!("{SIZE_CLASS_IMAGE_REPO}@{SIZE_CLASS_IMAGE_DIGEST}"),
+        Err(err) => {
+            return Err(err).context("ENCLAVA_INIT_IMAGE must be set for CAP genpolicy sidecars")
         }
-        Err(err) => return Err(err).context("ENCLAVA_INIT_IMAGE must be set for CAP genpolicy sidecars"),
     };
     if !image.contains("@sha256:") {
         bail!("ENCLAVA_INIT_IMAGE must be digest-pinned with @sha256:");
@@ -2053,12 +2070,12 @@ exit 101
         assert!(invocation
             .manifest_yaml
             .contains("image: ghcr.io/enclava-labs/demo@sha256:aaaa"));
+        assert!(invocation.manifest_yaml.contains(&format!(
+            "image: {DEFAULT_ATTESTATION_PROXY_IMAGE_REPO}@sha256:1111"
+        )));
         assert!(invocation
             .manifest_yaml
-            .contains("image: ghcr.io/enclava-labs/attestation-proxy@sha256:1111"));
-        assert!(invocation
-            .manifest_yaml
-            .contains("image: ghcr.io/enclava-labs/caddy-ingress@sha256:2222"));
+            .contains(&format!("image: {CADDY_INGRESS_IMAGE_REPO}@sha256:2222")));
         assert!(!invocation.manifest_yaml.contains("ghcr.io/enclava-ai/"));
         assert!(invocation
             .manifest_yaml
@@ -3131,5 +3148,63 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
         assert!(!normalized.contains(
             "    p_storage.driver_options == i_storage.driver_options\n    p_storage.fs_group       == i_storage.fs_group\n"
         ));
+    }
+
+    // Generator-growth detector: the deploy-side caps are sized to this policy class
+    // (API-side `MAX_POLICY_TEXT_BYTES` 160 KiB JSON-escaped and the composed
+    // proof-bundle budget 196,608; live baseline ~116-117 KiB raw, 113,601 B measured
+    // here with the stand-in image on genpolicy 3.28.0). A genpolicy, rules, or
+    // settings change that grows the output must fail here first: coordinate the
+    // deploy-side caps, then raise this bound in the same change.
+    const GENERATED_POLICY_SIZE_CLASS_MAX_BYTES: usize = 128 * 1024;
+    const GENERATED_POLICY_SIZE_CLASS_MIN_BYTES: usize = 64 * 1024;
+
+    // Production container layout with tiny pinned public images in place of the
+    // platform images (private registries would need credentials in CI). The size
+    // class is dominated by genpolicy boilerplate (~116 KiB of ~117 KiB live
+    // baseline), so image choice moves the total by a KiB or two.
+    fn size_class_descriptor() -> DeploymentDescriptor {
+        let mut descriptor = fixed_descriptor();
+        descriptor.image_ref = format!("{SIZE_CLASS_IMAGE_REPO}@{SIZE_CLASS_IMAGE_DIGEST}");
+        descriptor.image_digest = SIZE_CLASS_IMAGE_DIGEST.to_string();
+        descriptor.sidecars.attestation_proxy_digest = SIZE_CLASS_IMAGE_DIGEST.to_string();
+        descriptor.sidecars.caddy_digest = SIZE_CLASS_IMAGE_DIGEST.to_string();
+        descriptor
+    }
+
+    #[test]
+    fn generated_policy_size_class_stays_within_the_deploy_budget() {
+        let config = GenpolicyConfig::from_env();
+        let generated = match config.run(&size_class_descriptor()) {
+            Ok(generated) => generated,
+            // Skip only when no binary is installed at all (dev workstations);
+            // an explicit GENPOLICY_BIN or any other failure is a hard failure.
+            Err(err)
+                if std::env::var_os("GENPOLICY_BIN").is_none()
+                    && err.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                    }) =>
+            {
+                eprintln!("skipping size-class check: genpolicy binary not installed");
+                return;
+            }
+            Err(err) => panic!("genpolicy run failed: {err:#}"),
+        };
+        let size = generated.policy_text.len();
+        eprintln!("generated policy size class: {size} bytes");
+        assert!(
+            size <= GENERATED_POLICY_SIZE_CLASS_MAX_BYTES,
+            "genpolicy output grew to {size} bytes (bound {}); the deploy-side caps are sized \
+             to this policy class — coordinate the caps before raising this bound",
+            GENERATED_POLICY_SIZE_CLASS_MAX_BYTES
+        );
+        assert!(
+            size >= GENERATED_POLICY_SIZE_CLASS_MIN_BYTES,
+            "genpolicy output shrank to {size} bytes (bound {}); imploded generator output is \
+             as surprising as growth — verify the generation shape before adjusting this bound",
+            GENERATED_POLICY_SIZE_CLASS_MIN_BYTES
+        );
     }
 }
