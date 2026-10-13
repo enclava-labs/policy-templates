@@ -29,9 +29,10 @@ const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attesta
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 
 // genpolicy resolves every manifest image over the registry, so test builds swap the
-// private platform sidecar repos for the pinned public stand-in at the use site (the
-// size-class test must run without private-registry credentials). The production
-// literals above stay the single source and are pinned by a dedicated test.
+// platform sidecar repos for the pinned public stand-in at the use site: the
+// size-class test stays hermetic (no coupling to platform-package availability,
+// visibility, or registry rate limits in CI). The production literals above stay
+// the single source and are pinned by a dedicated test.
 fn sidecar_image_repo(repo: &str) -> &str {
     if cfg!(test) {
         SIZE_CLASS_IMAGE_REPO
@@ -3164,9 +3165,10 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     const GENERATED_POLICY_SIZE_CLASS_MIN_BYTES: usize = 64 * 1024;
 
     // Production container layout with tiny pinned public images in place of the
-    // platform images (private registries would need credentials in CI). The size
-    // class is dominated by genpolicy boilerplate (~116 KiB of ~117 KiB live
-    // baseline), so image choice moves the total by a KiB or two.
+    // platform images (hermeticity: no coupling to platform-package availability,
+    // visibility, or registry rate limits in CI). The size class is dominated by
+    // genpolicy boilerplate (~116 KiB of ~117 KiB live baseline), so image choice
+    // moves the total by a KiB or two.
     fn size_class_descriptor() -> DeploymentDescriptor {
         let mut descriptor = fixed_descriptor();
         descriptor.image_ref = format!("{SIZE_CLASS_IMAGE_REPO}@{SIZE_CLASS_IMAGE_DIGEST}");
