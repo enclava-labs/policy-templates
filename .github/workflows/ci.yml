@@ -24,8 +24,34 @@ jobs:
       - name: fmt
         working-directory: signing-service
         run: cargo fmt --check
+      - name: Cache kata-tools
+        id: kata-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/kata
+          key: kata-tools-${{ hashFiles('signing-service/Dockerfile') }}
+      - name: Install pinned genpolicy (policy size-class test)
+        if: steps.kata-cache.outputs.cache-hit != 'true'
+        working-directory: signing-service
+        run: |
+          set -eux
+          KATA_TOOLS_VERSION=$(sed -n 's/^ARG KATA_TOOLS_VERSION=//p' Dockerfile | head -1)
+          KATA_TOOLS_SHA256=$(sed -n 's/^ARG KATA_TOOLS_SHA256=//p' Dockerfile | head -1)
+          curl -fsSL -o /tmp/kata-tools.tar.zst \
+            "https://github.com/kata-containers/kata-containers/releases/download/${KATA_TOOLS_VERSION}/kata-tools-static-${KATA_TOOLS_VERSION}-amd64.tar.zst"
+          echo "${KATA_TOOLS_SHA256}  /tmp/kata-tools.tar.zst" | sha256sum -c -
+          mkdir -p /opt/kata
+          tar --zstd -xf /tmp/kata-tools.tar.zst -C /opt/kata \
+            ./opt/kata/bin/genpolicy \
+            ./opt/kata/share/defaults/kata-containers/rules.rego \
+            ./opt/kata/share/defaults/kata-containers/genpolicy-settings.json \
+            ./opt/kata/share/defaults/kata-containers/genpolicy-settings.d
       - name: test
         working-directory: signing-service
+        env:
+          GENPOLICY_BIN: /opt/kata/opt/kata/bin/genpolicy
+          GENPOLICY_RULES_PATH: /opt/kata/opt/kata/share/defaults/kata-containers/rules.rego
+          GENPOLICY_SETTINGS_DIR: /opt/kata/opt/kata/share/defaults/kata-containers
         run: cargo test --locked
       - name: clippy
         working-directory: signing-service
