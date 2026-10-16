@@ -1456,6 +1456,7 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
         ),
         mount("unlock-socket", "/run/enclava", false),
         mount("unlock-channel", "/run/enclava-unlock", false),
+        mount("luks-material", "/run/enclava-luks", false),
         mount("enclava-init-config", "/etc/enclava-init", true),
     ];
     if log_encryption.is_some() {
@@ -1507,6 +1508,7 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool)
         json!({"name": "enclava-tools", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-socket", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-channel", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+        json!({"name": "luks-material", "emptyDir": {"medium": "Memory", "sizeLimit": "48Mi"}}),
         json!({"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         json!({"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         config_map_volume(
@@ -2053,6 +2055,10 @@ exit 101
         assert!(invocation
             .manifest_yaml
             .contains("mountPath: /run/enclava-unlock"));
+        assert!(invocation.manifest_yaml.contains("name: luks-material"));
+        assert!(invocation
+            .manifest_yaml
+            .contains("mountPath: /run/enclava-luks"));
         assert!(invocation.manifest_yaml.contains("name: CADDY_SEED_PATH"));
         assert!(invocation
             .manifest_yaml
