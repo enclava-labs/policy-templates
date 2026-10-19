@@ -44,6 +44,7 @@ const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const ENCLAVA_LOG_RELAY_PORT: u16 = 8082;
 const ENCLAVA_TOOLS_INIT_COMMAND: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
+const ENCLAVA_TOOLS_INIT_COMMAND_NO_LOGS: &str = "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready";
 const ENCLAVA_INIT_WAIT_FOR_CONTAINERS: &str = "web,tenant-ingress,attestation-proxy";
 const CADDY_ACME_TLS_PORT: u16 = 10443;
 const CADDY_INTERNAL_TLS_PORT: u16 = 10443;
@@ -283,8 +284,10 @@ impl GenpolicyConfig {
 
 fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String> {
     // Pinned genpolicy appends JSON policy_data and ignores mountPropagation
-    // for emptyDirs. Correct the five platform-owned mounts before signing;
+    // for emptyDirs. Correct the platform-owned mounts before signing;
     // leave the Rego source, destination, type and options checks unchanged.
+    // The two `logs` mounts exist only when log encryption is enabled (v2
+    // layout): absent is fine, present gets the matching propagation fix.
     const SEPARATOR: &str = "\npolicy_data := ";
     let (rules, json_data) = policy_text
         .rsplit_once(SEPARATOR)
@@ -295,16 +298,25 @@ fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String>
         .get_mut("containers")
         .and_then(Value::as_array_mut)
         .context("genpolicy policy_data missing containers")?;
-    for (container_name, volume, destination, propagation) in [
-        ("web", "state-mount", "/state", "rslave"),
-        ("attestation-proxy", "state-mount", "/data", "rslave"),
-        ("attestation-proxy", "state-mount", "/state", "rslave"),
-        ("enclava-init", "state-mount", "/state", "rshared"),
+    for (container_name, volume, destination, propagation, required) in [
+        ("web", "state-mount", "/state", "rslave", true),
+        ("web", "logs", "/run/enclava-logs", "rslave", false),
+        ("attestation-proxy", "state-mount", "/data", "rslave", true),
+        ("attestation-proxy", "state-mount", "/state", "rslave", true),
+        ("enclava-init", "state-mount", "/state", "rshared", true),
         (
             "enclava-init",
             "tls-state-mount",
             "/state/tls-state",
             "rshared",
+            true,
+        ),
+        (
+            "enclava-init",
+            "logs",
+            "/run/enclava-logs",
+            "rshared",
+            false,
         ),
     ] {
         let matching = containers
@@ -329,6 +341,9 @@ fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String>
             .filter(|mount| mount.get("destination").and_then(Value::as_str) == Some(destination))
             .collect::<Vec<_>>();
         if matching.len() != 1 {
+            if matching.is_empty() && !required {
+                continue;
+            }
             bail!("genpolicy platform mount missing or duplicated");
         }
         let mount = matching.into_iter().next().unwrap();
@@ -507,10 +522,12 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     let normalized = normalize_cap_storage_mounts(&normalized);
     let normalized = normalize_cap_sandbox_storages(&normalized);
     let normalized = normalize_cap_extra_storages(&normalized);
-    // Signed with the exact policy bytes: CAP keeps historical, unmarked
-    // artifacts on disk-backed volumes during retry and rollback.
+    // Signed with the exact policy bytes: CAP keeps historical, unmarked and
+    // v1 artifacts on their recorded volume layouts during retry and rollback.
+    // v2 = bootstrap Memory volumes plus, when log encryption is enabled, a
+    // Memory logs mountpoint bind-bound to the encrypted state PVC.
     format!(
-        "# enclava-cap-volume-layout: guest-memory-v1\n{}",
+        "# enclava-cap-volume-layout: guest-memory-v2\n{}",
         normalize_privileged_caps_placeholder(&normalized)
     )
 }
@@ -785,7 +802,7 @@ fn render_pod_manifest(
                 "supplementalGroups": [6],
             },
             "initContainers": [
-                enclava_tools_container()?,
+                enclava_tools_container(log_encryption.is_some())?,
             ],
             "containers": containers,
             "volumes": cap_volumes(descriptor, log_encryption.is_some()),
@@ -1186,7 +1203,12 @@ fn app_container(
         "HostToContainer",
     ));
     if log_encryption.is_some() {
-        volume_mounts.push(mount("logs", ENCLAVA_LOG_SPOOL_DIR, false));
+        volume_mounts.push(mount_with_propagation(
+            "logs",
+            ENCLAVA_LOG_SPOOL_DIR,
+            false,
+            "HostToContainer",
+        ));
     }
     let mut env_vars: Vec<Value> = oci
         .env
@@ -1411,7 +1433,14 @@ fn tenant_ingress_container_for_mode(
     })
 }
 
-fn enclava_tools_container() -> Result<Value> {
+fn enclava_tools_container(log_enabled: bool) -> Result<Value> {
+    let mut volume_mounts = vec![
+        mount("enclava-tools", "/work", false),
+        mount("unlock-socket", "/run/enclava", false),
+    ];
+    if log_enabled {
+        volume_mounts.push(mount("logs", ENCLAVA_LOG_SPOOL_DIR, false));
+    }
     Ok(json!({
         "name": "enclava-tools",
         "image": enclava_init_image()?,
@@ -1419,13 +1448,13 @@ fn enclava_tools_container() -> Result<Value> {
             "/bin/sh",
             "-eu",
             "-c",
-            ENCLAVA_TOOLS_INIT_COMMAND,
+            if log_enabled {
+                ENCLAVA_TOOLS_INIT_COMMAND
+            } else {
+                ENCLAVA_TOOLS_INIT_COMMAND_NO_LOGS
+            },
         ],
-        "volumeMounts": [
-            mount("enclava-tools", "/work", false),
-            mount("unlock-socket", "/run/enclava", false),
-            mount("logs", ENCLAVA_LOG_SPOOL_DIR, false),
-        ],
+        "volumeMounts": volume_mounts,
         "securityContext": security_context(0, 0, true, false, false, caps(&["ALL"], &[])),
         "resources": resources("10m", "16Mi", "50m", "64Mi"),
     }))
@@ -1469,7 +1498,12 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
             "ENCLAVA_LOG_RELAY_SPOOL_PATH",
             format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
         ));
-        volume_mounts.push(mount("logs", ENCLAVA_LOG_SPOOL_DIR, false));
+        volume_mounts.push(mount_with_propagation(
+            "logs",
+            ENCLAVA_LOG_SPOOL_DIR,
+            false,
+            "Bidirectional",
+        ));
     }
     Ok(json!({
         "name": "enclava-init",
@@ -1495,15 +1529,14 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
     }))
 }
 
-fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool) -> Vec<Value> {
+fn cap_volumes(descriptor: &DeploymentDescriptor, log_encryption_enabled: bool) -> Vec<Value> {
     let mut volumes = vec![
-        json!({"name": "logs", "emptyDir": {}}),
         json!({"name": "ownership-signal", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
         config_map_volume(
             "tenant-ingress-caddyfile",
             format!("{}-tenant-ingress", descriptor.app_name),
         ),
-        // Match CAP's guest-memory helpers/mountpoints; logs and raw PVCs stay disk-backed.
+        // Match CAP's guest-memory helpers/mountpoints; raw PVCs stay disk-backed.
         // Kata does not currently forward these sizeLimit declarations as guest hard bounds.
         json!({"name": "enclava-tools", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
         json!({"name": "unlock-socket", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}}),
@@ -1516,7 +1549,17 @@ fn cap_volumes(descriptor: &DeploymentDescriptor, _log_encryption_enabled: bool)
             format!("{}-enclava-init", descriptor.app_name),
         ),
     ];
+    if log_encryption_enabled {
+        // v2 layout: a 1Mi Memory mountpoint enclava-init rebinds onto the
+        // encrypted state PVC; only pre-unlock bootstrap writes land in it.
+        volumes.insert(
+            0,
+            json!({"name": "logs", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+        );
+    }
     if descriptor_uses_startup_fallback(descriptor) {
+        // Index 3 lands after the fixed bootstrap header whether or not the
+        // logs volume is present above it.
         volumes.insert(
             3,
             config_map_volume("startup", format!("{}-startup", descriptor.app_name)),
@@ -1627,6 +1670,55 @@ mod tests {
             policy.split_once("\npolicy_data := ").unwrap().0,
             corrected.split_once("\npolicy_data := ").unwrap().0
         );
+    }
+
+    #[test]
+    fn memory_propagation_corrects_v2_log_spool_mounts_when_present() {
+        let policy = synthetic_memory_policy();
+        let (rules, data) = policy.rsplit_once("\npolicy_data := ").unwrap();
+        let mut data: Value = serde_json::from_str(data).unwrap();
+        for container in [0, 2] {
+            data["containers"][container]["OCI"]["Mounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "destination": "/run/enclava-logs", "type_": "bind",
+                    "source": "^/run/kata-containers/sandbox/ephemeral/logs$",
+                    "options": ["rbind", "rprivate", "rw"]
+                }));
+        }
+        let corrected =
+            normalize_guest_memory_mount_propagation(&format!("{rules}\npolicy_data := {data}"))
+                .unwrap();
+        let corrected_data: Value =
+            serde_json::from_str(corrected.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        for (container, propagation) in [(0, "rslave"), (2, "rshared")] {
+            let mounts = corrected_data["containers"][container]["OCI"]["Mounts"]
+                .as_array()
+                .unwrap();
+            let logs = mounts
+                .iter()
+                .find(|mount| mount["destination"] == "/run/enclava-logs")
+                .unwrap();
+            assert_eq!(logs["options"], json!(["rbind", propagation, "rw"]));
+        }
+        // A duplicated optional spool mount still fails closed.
+        let mut data: Value =
+            serde_json::from_str(policy.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        let logs_mount = json!({
+            "destination": "/run/enclava-logs", "type_": "bind",
+            "source": "^/run/kata-containers/sandbox/ephemeral/logs$",
+            "options": ["rbind", "rprivate", "rw"]
+        });
+        let mounts = data["containers"][0]["OCI"]["Mounts"]
+            .as_array_mut()
+            .unwrap();
+        mounts.push(logs_mount.clone());
+        mounts.push(logs_mount);
+        assert!(normalize_guest_memory_mount_propagation(&format!(
+            "{rules}\npolicy_data := {data}"
+        ))
+        .is_err());
     }
 
     #[test]
@@ -1926,7 +2018,7 @@ exit 101
     }
 
     #[test]
-    fn bootstrap_volume_backing_matches_cap_without_changing_log_storage() {
+    fn bootstrap_volume_backing_matches_cap_with_conditional_log_spool() {
         for logs_enabled in [false, true] {
             let volumes = cap_volumes(&fixed_descriptor(), logs_enabled);
             for (name, size) in [
@@ -1940,8 +2032,15 @@ exit 101
                     json!({"medium": "Memory", "sizeLimit": size})
                 );
             }
-            let logs = volumes.iter().find(|v| v["name"] == "logs").unwrap();
-            assert_eq!(logs["emptyDir"], json!({}));
+            let logs = volumes.iter().find(|v| v["name"] == "logs");
+            match (logs_enabled, logs) {
+                (true, Some(volume)) => assert_eq!(
+                    volume["emptyDir"],
+                    json!({"medium": "Memory", "sizeLimit": "1Mi"})
+                ),
+                (false, None) => {}
+                _ => panic!("logs volume presence must follow log encryption"),
+            }
         }
     }
 
@@ -1950,7 +2049,7 @@ exit 101
         let policy = "package agent_policy\n";
         assert_eq!(
             normalize_cap_generated_policy(policy),
-            "# enclava-cap-volume-layout: guest-memory-v1\npackage agent_policy\n"
+            "# enclava-cap-volume-layout: guest-memory-v2\npackage agent_policy\n"
         );
     }
 
@@ -2312,10 +2411,14 @@ exit 101
             Some(&json!(true))
         );
         assert_eq!(enclava_tools.pointer("/command/1"), Some(&json!("-eu")));
-        assert_eq!(
-            enclava_tools.pointer("/command/3"),
-            Some(&json!(ENCLAVA_TOOLS_INIT_COMMAND))
-        );
+        let command = enclava_tools
+            .pointer("/command/3")
+            .and_then(Value::as_str)
+            .expect("enclava-tools init command is rendered");
+        assert_eq!(command, ENCLAVA_TOOLS_INIT_COMMAND_NO_LOGS);
+        assert!(!command.contains("/run/enclava-logs"));
+        assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+        assert!(command.contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
         let tool_mounts = enclava_tools
             .pointer("/volumeMounts")
             .and_then(Value::as_array)
@@ -2325,11 +2428,21 @@ exit 101
                 && mount.pointer("/mountPath") == Some(&json!("/run/enclava"))
                 && mount.pointer("/readOnly") == Some(&json!(false))
         }));
-        assert!(tool_mounts.iter().any(|mount| {
-            mount.pointer("/name") == Some(&json!("logs"))
-                && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
-                && mount.pointer("/readOnly") == Some(&json!(false))
-        }));
+        assert!(
+            tool_mounts
+                .iter()
+                .all(|mount| mount.pointer("/name") != Some(&json!("logs"))),
+            "logging-disabled pod mounts no logs volume into enclava-tools"
+        );
+        assert!(
+            !manifest
+                .pointer("/spec/volumes")
+                .and_then(Value::as_array)
+                .expect("volumes are present")
+                .iter()
+                .any(|volume| volume.pointer("/name") == Some(&json!("logs"))),
+            "logging-disabled pod declares no logs volume"
+        );
 
         let app_containers = manifest
             .pointer("/spec/containers")
@@ -2400,6 +2513,7 @@ exit 101
             mount.pointer("/name") == Some(&json!("logs"))
                 && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
                 && mount.pointer("/readOnly") == Some(&json!(false))
+                && mount.pointer("/mountPropagation") == Some(&json!("HostToContainer"))
         }));
 
         assert!(
@@ -2432,11 +2546,37 @@ exit 101
             mount.pointer("/name") == Some(&json!("logs"))
                 && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
                 && mount.pointer("/readOnly") == Some(&json!(false))
+                && mount.pointer("/mountPropagation") == Some(&json!("Bidirectional"))
         }));
+        let enclava_tools = manifest
+            .pointer("/spec/initContainers/0")
+            .expect("enclava-tools init container is present");
+        assert_eq!(
+            enclava_tools.pointer("/command/3"),
+            Some(&json!(ENCLAVA_TOOLS_INIT_COMMAND))
+        );
+        assert!(enclava_tools
+            .pointer("/volumeMounts")
+            .and_then(Value::as_array)
+            .expect("enclava-tools volumeMounts are present")
+            .iter()
+            .any(|mount| {
+                mount.pointer("/name") == Some(&json!("logs"))
+                    && mount.pointer("/mountPath") == Some(&json!(ENCLAVA_LOG_SPOOL_DIR))
+                    && mount.pointer("/readOnly") == Some(&json!(false))
+            }));
         let volumes = manifest
             .pointer("/spec/volumes")
             .and_then(Value::as_array)
             .expect("volumes are present");
+        let logs_volume = volumes
+            .iter()
+            .find(|volume| volume.pointer("/name") == Some(&json!("logs")))
+            .expect("log encryption renders the logs mountpoint volume");
+        assert_eq!(
+            logs_volume.pointer("/emptyDir"),
+            Some(&json!({"medium": "Memory", "sizeLimit": "1Mi"}))
+        );
         assert!(!volumes
             .iter()
             .any(|volume| volume.pointer("/name") == Some(&json!("log-relay-tmp"))));
