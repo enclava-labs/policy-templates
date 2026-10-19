@@ -1806,9 +1806,9 @@ mod tests {
                 std::env::var("GENPOLICY_SETTINGS").expect("GENPOLICY_SETTINGS is required");
             let dir = tempfile::tempdir().unwrap();
             let containers = [
-                ("web", vec![("state-mount", "/state", "HostToContainer")]),
+                ("web", vec![("state-mount", "/state", "HostToContainer"), ("logs", "/run/enclava-logs", "HostToContainer")]),
                 ("attestation-proxy", vec![("state-mount", "/data", "HostToContainer"), ("state-mount", "/state", "HostToContainer")]),
-                ("enclava-init", vec![("state-mount", "/state", "Bidirectional"), ("tls-state-mount", "/state/tls-state", "Bidirectional")]),
+                ("enclava-init", vec![("state-mount", "/state", "Bidirectional"), ("tls-state-mount", "/state/tls-state", "Bidirectional"), ("logs", "/run/enclava-logs", "Bidirectional")]),
             ].into_iter().map(|(name, mounts)| json!({
                 "name": name,
                 "image": "ghcr.io/enclava-labs/enclava-init@sha256:ede2934373ba3e4414ebe6fb358416046f41c0fb7d70dd4a9d607fa248183073",
@@ -1817,7 +1817,7 @@ mod tests {
             })).collect::<Vec<_>>();
             let manifest = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "synthetic-mount-check", "namespace": "synthetic"}, "spec": {
                 "containers": containers,
-                "volumes": [{"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}, {"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}]
+                "volumes": [{"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}, {"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}, {"name": "logs", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}]
             }});
             let path = dir.path().join("synthetic.yaml");
             fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
@@ -1849,7 +1849,22 @@ mod tests {
             );
             String::from_utf8(output.stdout).unwrap()
         } else {
-            synthetic_memory_policy()
+            // Same logs mounts the real generator produces for the fixture
+            // above, injected into the synthetic policy_data.
+            let policy = synthetic_memory_policy();
+            let (rules, data) = policy.rsplit_once("\npolicy_data := ").unwrap();
+            let mut data: Value = serde_json::from_str(data).unwrap();
+            for container in [0, 2] {
+                data["containers"][container]["OCI"]["Mounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "destination": "/run/enclava-logs", "type_": "bind",
+                        "source": "^/run/kata-containers/sandbox/ephemeral/logs$",
+                        "options": ["rbind", "rprivate", "rw"]
+                    }));
+            }
+            format!("{rules}\npolicy_data := {data}")
         };
         let corrected = normalize_guest_memory_mount_propagation(&fixture).unwrap();
         // Evaluate the actual pinned check_mount through the production
@@ -1880,10 +1895,12 @@ allowed if {
             serde_json::from_str(fixture.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
         for (name, destination, propagation) in [
             ("web", "/state", "rslave"),
+            ("web", "/run/enclava-logs", "rslave"),
             ("attestation-proxy", "/data", "rslave"),
             ("attestation-proxy", "/state", "rslave"),
             ("enclava-init", "/state", "rshared"),
             ("enclava-init", "/state/tls-state", "rshared"),
+            ("enclava-init", "/run/enclava-logs", "rshared"),
         ] {
             let container = data["containers"]
                 .as_array()
