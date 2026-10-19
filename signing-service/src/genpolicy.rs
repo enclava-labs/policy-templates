@@ -83,6 +83,23 @@ const ROOTFUL_SUDO_CAPS: &[&str] = &[
     "AUDIT_WRITE",
 ];
 
+fn log_spool_path(log_encryption: &LogEncryptionConfig) -> String {
+    let digest = log_encryption
+        .public_key_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or(&log_encryption.public_key_sha256)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{ENCLAVA_LOG_SPOOL_DIR}/web-{digest}.jsonl")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaddyTlsMode {
     Acme,
@@ -1233,10 +1250,7 @@ fn app_container(
                 &log_encryption.public_key_sha256,
             ),
             value_env("ENCLAVA_LOG_CONTAINER_NAME", "web"),
-            value_env(
-                "ENCLAVA_LOG_SPOOL_PATH",
-                format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
-            ),
+            value_env("ENCLAVA_LOG_SPOOL_PATH", log_spool_path(log_encryption)),
         ]);
     }
     let env = with_kubernetes_service_env(env_vars);
@@ -1488,7 +1502,7 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
         mount("luks-material", "/run/enclava-luks", false),
         mount("enclava-init-config", "/etc/enclava-init", true),
     ];
-    if log_encryption.is_some() {
+    if let Some(log_encryption) = log_encryption {
         env.push(value_env(
             "ENCLAVA_LOG_RELAY_BIND",
             format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
@@ -1496,7 +1510,7 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
         env.push(value_env("ENCLAVA_LOG_RELAY_CONTAINER", "web"));
         env.push(value_env(
             "ENCLAVA_LOG_RELAY_SPOOL_PATH",
-            format!("{ENCLAVA_LOG_SPOOL_DIR}/web.jsonl"),
+            log_spool_path(log_encryption),
         ));
         volume_mounts.push(mount_with_propagation(
             "logs",
@@ -2512,7 +2526,10 @@ exit 101
                 "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU",
             ),
             ("ENCLAVA_LOG_CONTAINER_NAME", "web"),
-            ("ENCLAVA_LOG_SPOOL_PATH", "/run/enclava-logs/web.jsonl"),
+            (
+                "ENCLAVA_LOG_SPOOL_PATH",
+                "/run/enclava-logs/web-Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU.jsonl",
+            ),
         ] {
             assert!(
                 app_env.iter().any(|entry| {
@@ -2545,7 +2562,9 @@ exit 101
             .expect("enclava-init sidecar is present");
         assert_eq!(
             env_value(enclava_init, "ENCLAVA_LOG_RELAY_SPOOL_PATH"),
-            Some(&json!("/run/enclava-logs/web.jsonl"))
+            Some(&json!(
+                "/run/enclava-logs/web-Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU.jsonl"
+            ))
         );
         assert_eq!(
             env_value(enclava_init, "ENCLAVA_LOG_RELAY_BIND"),
