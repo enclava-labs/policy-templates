@@ -1,8 +1,8 @@
 # Genpolicy Adapter
 
-The signing service now has a command adapter for Kata `genpolicy`, but local CI
-does not execute upstream `genpolicy` because the binary and platform settings
-are not present in this repo.
+The signing service runs the pinned Kata `genpolicy` binary. CI verifies the
+publisher archive checksum and exercises policy generation with its matching
+rules and settings.
 
 The adapter is intentionally explicit:
 
@@ -20,18 +20,17 @@ The generated `pod.yaml` is derived only from the verified signed
 image digest, command, args, env, ports, mounts, capabilities, resources, and
 security context.
 
-Unit coverage asserts the exact argv and manifest fields. The `/sign` endpoint
-runs this adapter after descriptor/keyring verification and before signing the
-KBS policy artifact. A failed `genpolicy` invocation rejects the signing
-request.
+The `/sign` endpoint runs this adapter after descriptor/keyring verification
+and before signing the KBS policy artifact. A failed `genpolicy` invocation
+rejects the signing request.
 
 The platform genpolicy pin is
-`kata-containers/genpolicy@3.32.0+337b6002681479fb6a605ca8a7a1138e81b6098c`,
-which must match the Kata shim version running on the SNP workers; confirm
-the live worker Kata version before rollout.
+`kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596`,
+which must match the Kata shim version running on the SNP workers. Changing
+the generator also changes signed workload policy hashes.
 The Dockerfile verifies and extracts `genpolicy` from
-`kata-tools-static-3.32.0-amd64.tar.zst` with digest
-`f11a49d7a15f81a7ec3289293fa44ebe9c29610b6578535b35f1d604f22d6015`, along
+`kata-tools-static-3.28.0-amd64.tar.zst` with digest
+`825dbf929dc5fe3f77d1a473511fd8950f08b5f81b33803c79085dbc233ab94b`, along
 with the matching `rules.rego` and settings files.
 
 Source contract checked while implementing: Kata documents `genpolicy -y
