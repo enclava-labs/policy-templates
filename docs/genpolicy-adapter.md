@@ -25,12 +25,13 @@ runs this adapter after descriptor/keyring verification and before signing the
 KBS policy artifact. A failed `genpolicy` invocation rejects the signing
 request.
 
-The cap-test01 validation pin is
-`kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596`,
-matching the live Kata shim version reported on the SNP worker.
+The platform genpolicy pin is
+`kata-containers/genpolicy@3.32.0+337b6002681479fb6a605ca8a7a1138e81b6098c`,
+which must match the Kata shim version running on the SNP workers; confirm
+the live worker Kata version before rollout.
 The Dockerfile verifies and extracts `genpolicy` from
-`kata-tools-static-3.28.0-amd64.tar.zst` with digest
-`825dbf929dc5fe3f77d1a473511fd8950f08b5f81b33803c79085dbc233ab94b`, along
+`kata-tools-static-3.32.0-amd64.tar.zst` with digest
+`f11a49d7a15f81a7ec3289293fa44ebe9c29610b6578535b35f1d604f22d6015`, along
 with the matching `rules.rego` and settings files.
 
 Source contract checked while implementing: Kata documents `genpolicy -y
