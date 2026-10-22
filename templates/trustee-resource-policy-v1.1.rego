@@ -63,10 +63,23 @@ attested_workload if {
 # "warning", "contraindicated"); anything short of affirming — including a
 # token with no submods at all — denies. A warning is not good enough: it is
 # how a measurement or reported-TCB mismatch is reported.
+# The verdict check must read submods from the same claim roots the
+# measurement helpers use: an EAR wrapped under input.claims carries its
+# submods on the wrapper, so a top-level-only check denies that supported
+# input shape. Every root that presents submods must come back affirming
+# (a mixed shape must not smuggle a warning past the check), and at least
+# one root must present submods at all — a token with none denies.
+submod_bearing_roots contains root if {
+  some root in claim_roots
+  count(object.get(root, "submods", {})) > 0
+}
+
 affirming_attestation if {
-  count(object.get(input, "submods", {})) > 0
-  every submod in object.get(input, "submods", {}) {
-    submod["ear.status"] == "affirming"
+  count(submod_bearing_roots) > 0
+  every root in submod_bearing_roots {
+    every name, submod in object.get(root, "submods", {}) {
+      submod["ear.status"] == "affirming"
+    }
   }
 }
 

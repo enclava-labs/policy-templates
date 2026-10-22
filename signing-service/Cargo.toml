@@ -21,3 +21,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+# Same engine + features as the KBS policy engine (trustee deps/policy-engine),
+# so template-semantics tests evaluate exactly what production evaluates.
+regorus = { version = "0.5.0", default-features = false, features = ["regex", "base64", "time", "std"] }

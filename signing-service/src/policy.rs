@@ -846,4 +846,88 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(fixture, expected);
     }
+
+    fn eval_policy_allow(
+        rendered: &str,
+        input: serde_json::Value,
+        data: serde_json::Value,
+    ) -> bool {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy(String::new(), rendered.to_string())
+            .expect("add resource policy");
+        engine
+            .add_data(regorus::Value::from_json_str(&data.to_string()).unwrap())
+            .expect("add data document");
+        engine
+            .set_input_json(&input.to_string())
+            .expect("set evaluation input");
+        let value = engine
+            .eval_rule("data.policy.allow".to_string())
+            .expect("eval allow rule");
+        serde_json::to_value(value)
+            .expect("convert regorus value")
+            .as_bool()
+            .expect("allow evaluates to a boolean")
+    }
+
+    #[test]
+    fn resource_policy_v11_verdict_covers_direct_and_wrapped_ears() {
+        let descriptor = descriptor_for_service();
+        let rendered = render_template(&descriptor).unwrap();
+        let data = serde_json::json!({
+            "plugin": "resource",
+            "method": "GET",
+            "resource-path": descriptor.kbs_resource_path.split('/').collect::<Vec<_>>(),
+        });
+
+        let claims = |status: &str| {
+            serde_json::json!({
+                "init_data_hash": hex::encode(descriptor.expected_cc_init_data_hash),
+                "init_data_claims": {
+                    "image_digest": descriptor.image_digest,
+                    "signer_identity_subject": descriptor.signer_identity.subject,
+                    "signer_identity_issuer": descriptor.signer_identity.issuer,
+                    "namespace": descriptor.namespace,
+                    "service_account": descriptor.service_account,
+                    "identity_hash": hex::encode(descriptor.identity_hash),
+                },
+                "submods": { "cpu0": { "ear.status": status } },
+            })
+        };
+        let wrapped = |status: &str| serde_json::json!({ "claims": claims(status) });
+
+        assert!(
+            eval_policy_allow(&rendered, claims("affirming"), data.clone()),
+            "an affirming direct EAR must release"
+        );
+        assert!(
+            eval_policy_allow(&rendered, wrapped("affirming"), data.clone()),
+            "an affirming wrapped EAR must release (the input.claims shape)"
+        );
+        for status in ["warning", "contraindicated", "none"] {
+            assert!(
+                !eval_policy_allow(&rendered, claims(status), data.clone()),
+                "a direct EAR with status {status} must deny"
+            );
+            assert!(
+                !eval_policy_allow(&rendered, wrapped(status), data.clone()),
+                "a wrapped EAR with status {status} must deny"
+            );
+        }
+
+        let mut mixed = claims("affirming");
+        mixed["claims"] = claims("warning");
+        assert!(
+            !eval_policy_allow(&rendered, mixed, data.clone()),
+            "a warning under any presented claim root must deny"
+        );
+
+        let mut bare = claims("affirming");
+        bare.as_object_mut().unwrap().remove("submods");
+        assert!(
+            !eval_policy_allow(&rendered, bare, data.clone()),
+            "a token with no submods at all must deny"
+        );
+    }
 }
