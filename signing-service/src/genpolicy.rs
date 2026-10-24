@@ -1539,7 +1539,7 @@ fn enclava_init_container(log_encryption: Option<&LogEncryptionConfig>) -> Resul
             {"name": "tls-state", "devicePath": "/dev/csi1"},
         ],
         "securityContext": security_context(0, 0, true, true, true, caps(&["ALL"], &["$(privileged_caps)"])),
-        "resources": resources("50m", "64Mi", "250m", "512Mi"),
+        "resources": resources("50m", "64Mi", "500m", "512Mi"),
     }))
 }
 
@@ -3397,15 +3397,15 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
             eprintln!("generated policy size class: {size} bytes");
             assert!(
                 size <= GENERATED_POLICY_SIZE_CLASS_MAX_BYTES,
-                "genpolicy output grew to {size} bytes (bound {}); the deploy-side caps are sized \
-                 to this policy class — coordinate the caps before raising this bound",
-                GENERATED_POLICY_SIZE_CLASS_MAX_BYTES
+                "genpolicy output grew to {size} bytes (bound {GENERATED_POLICY_SIZE_CLASS_MAX_BYTES}); \
+                 the deploy-side caps are sized to this policy class — coordinate the caps before \
+                 raising this bound"
             );
             assert!(
                 size >= GENERATED_POLICY_SIZE_CLASS_MIN_BYTES,
-                "genpolicy output shrank to {size} bytes (bound {}); imploded generator output is \
-                 as surprising as growth — verify the generation shape before adjusting this bound",
-                GENERATED_POLICY_SIZE_CLASS_MIN_BYTES
+                "genpolicy output shrank to {size} bytes (bound {GENERATED_POLICY_SIZE_CLASS_MIN_BYTES}); \
+                 imploded generator output is as surprising as growth — verify the generation shape \
+                 before adjusting this bound"
             );
         }
     }
