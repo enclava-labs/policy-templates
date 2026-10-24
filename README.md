@@ -56,6 +56,11 @@ Optional local/dev env:
   `docs/genpolicy-adapter.md`. The service refuses to start if
   `GENPOLICY_VERSION_PIN` is missing, `unconfigured`, or `unpinned`.
 
+The rendered `enclava-init` sidecar matches CAP's resource budget: `50m` CPU
+request, `500m` CPU limit, and `64Mi`/`512Mi` memory request/limit. Keep these
+values aligned with CAP's container render and tenant quota arithmetic; this
+budget is separate from the primary workload's resource allowance.
+
 ## Signing Service Image
 
 Build the image from the repository root so the crate can embed the reviewed
