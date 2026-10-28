@@ -533,7 +533,6 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
     }
 
     let normalized = lines.concat();
-    let normalized = normalize_cap_overlay_root_path(&normalized);
     let normalized = normalize_cap_sandbox_pidns(&normalized);
     let normalized = normalize_rootfs_propagation(&normalized);
     let normalized = normalize_cap_storage_mounts(&normalized);
@@ -547,14 +546,6 @@ fn normalize_cap_generated_policy(policy_text: &str) -> String {
         "# enclava-cap-volume-layout: guest-memory-v2\n{}",
         normalize_privileged_caps_placeholder(&normalized)
     )
-}
-
-fn normalize_cap_overlay_root_path(policy_text: &str) -> String {
-    const DEFAULT_ROOT_PATH: &str = r#""root_path": "/run/kata-containers/$(bundle-id)/rootfs""#;
-    const OVERLAY_ROOT_PATH: &str =
-        r#""root_path": "/run/kata-containers/(?:shared/containers/)?$(bundle-id)/rootfs""#;
-
-    policy_text.replace(DEFAULT_ROOT_PATH, OVERLAY_ROOT_PATH)
 }
 
 fn normalize_cap_sandbox_pidns(policy_text: &str) -> String {
@@ -2005,6 +1996,161 @@ allowed if {
             }
         }
     }
+    #[test]
+    #[ignore = "requires OPA_BIN; GENPOLICY_BIN/GENPOLICY_SETTINGS run the real generator"]
+    fn guest_pull_storage_matches_literal_root_path() {
+        // Regression: kata 4.3.1 guest-pull sends image_guest_pull storages
+        // whose mount_point is the literal /run/kata-containers/<id>/rootfs.
+        // policy_data.common.root_path must stay literal so
+        // `expect_root_path == i_storage.mount_point` holds; the removed
+        // overlay regex rewrite made this check unsatisfiable.
+        let opa = std::env::var("OPA_BIN").expect("OPA_BIN is required");
+        let binary = std::env::var("GENPOLICY_BIN").expect("GENPOLICY_BIN is required");
+        let settings = std::env::var("GENPOLICY_SETTINGS").expect("GENPOLICY_SETTINGS is required");
+        let dir = tempfile::tempdir().unwrap();
+        let containers = [
+            ("web", vec![("state-mount", "/state", "HostToContainer")]),
+            (
+                "attestation-proxy",
+                vec![
+                    ("state-mount", "/data", "HostToContainer"),
+                    ("state-mount", "/state", "HostToContainer"),
+                ],
+            ),
+            (
+                "enclava-init",
+                vec![
+                    ("state-mount", "/state", "Bidirectional"),
+                    ("tls-state-mount", "/state/tls-state", "Bidirectional"),
+                ],
+            ),
+        ]
+        .into_iter()
+        .map(|(name, mounts)| {
+            json!({
+                "name": name,
+                "image": "ghcr.io/enclava-labs/enclava-init@sha256:ede2934373ba3e4414ebe6fb358416046f41c0fb7d70dd4a9d607fa248183073",
+                "command": ["/bin/true"],
+                "volumeMounts": mounts.into_iter().map(|(name, path, propagation)| mount_with_propagation(name, path, false, propagation)).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+        let manifest = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "guest-pull-check", "namespace": "synthetic"}, "spec": {
+            "containers": containers,
+            "volumes": [{"name": "state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}, {"name": "tls-state-mount", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}]
+        }});
+        let path = dir.path().join("synthetic.yaml");
+        fs::write(&path, serde_yaml::to_string(&manifest).unwrap()).unwrap();
+        let args = vec![
+            "-y".to_string(),
+            path.display().to_string(),
+            "-p".to_string(),
+            format!("{settings}/rules.rego"),
+            "-j".to_string(),
+            settings,
+            "-r".to_string(),
+            "-u".to_string(),
+            "-s".to_string(),
+        ];
+        let auth = dir.path().join("config.json");
+        fs::write(&auth, r#"{"auths":{}}"#).unwrap();
+        let output = Command::new(&binary)
+            .args(&args)
+            .current_dir(dir.path())
+            .env("DOCKER_CONFIG", dir.path())
+            .env("REGISTRY_AUTH_FILE", &auth)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "synthetic genpolicy failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let fixture = String::from_utf8(output.stdout).unwrap();
+        let corrected = normalize_guest_memory_mount_propagation(&fixture).unwrap();
+        let policy_text = normalize_cap_generated_policy(&corrected);
+        let data: Value =
+            serde_json::from_str(policy_text.rsplit_once("\npolicy_data := ").unwrap().1).unwrap();
+        assert_eq!(
+            data["common"]["root_path"],
+            json!("/run/kata-containers/$(bundle-id)/rootfs"),
+            "common.root_path must stay the literal template for guest-pull storage checks"
+        );
+        let p_container = data["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|container| {
+                container
+                    .pointer("/OCI/Annotations/io.kubernetes.cri.container-type")
+                    .and_then(Value::as_str)
+                    == Some("sandbox")
+            })
+            .unwrap()
+            .clone();
+        let bundle_id = "d6131bce165819e670253d2cecdad00fbf00fa411467c5e8562188c2dbeefb59";
+        // Captured live image_guest_pull storage from the denied 4.3.1
+        // CreateContainerRequest (source "pause", literal rootfs path).
+        let i_storage = json!({
+            "driver": "image_guest_pull", "driver_options": [], "fs_group": null,
+            "fstype": "overlay",
+            "mount_point": format!("/run/kata-containers/{bundle_id}/rootfs"),
+            "options": [], "shared": false, "source": "pause"
+        });
+        let mut wrong_storage = i_storage.clone();
+        wrong_storage["mount_point"] = json!(format!(
+            "/run/kata-containers/shared/containers/{bundle_id}/rootfs"
+        ));
+        let mut other_storage = i_storage.clone();
+        other_storage["mount_point"] = json!("/run/kata-containers/other-id/rootfs");
+        let rules = r#"
+default allowed := false
+allowed if {
+    allow_storage(input.p_container, input.i_storage, input.bundle_id, input.sandbox_id)
+}
+"#;
+        let policy = format!(
+            "{}\n{rules}\npolicy_data := {}",
+            policy_text.rsplit_once("\npolicy_data := ").unwrap().0,
+            data
+        );
+        let path = dir.path().join("policy.rego");
+        fs::write(&path, &policy).unwrap();
+        for (storage, expected) in [
+            (&i_storage, true),
+            (&wrong_storage, false),
+            (&other_storage, false),
+        ] {
+            let input = dir.path().join("input.json");
+            fs::write(
+                &input,
+                json!({
+                    "p_container": p_container, "i_storage": storage,
+                    "bundle_id": bundle_id, "sandbox_id": bundle_id,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let output = Command::new(&opa)
+                .args(["eval", "--v0-compatible", "--format=raw", "--data"])
+                .arg(&path)
+                .arg("--input")
+                .arg(&input)
+                .arg("data.agent_policy.allowed")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                expected.to_string()
+            );
+        }
+    }
 
     #[test]
     #[cfg(unix)]
@@ -3196,23 +3342,6 @@ allow_create_container_input if {
         assert!(normalized.contains("rootfs_propagation == \"rshared\""));
         assert!(normalized.contains("rootfs_propagation == \"rslave\""));
         assert!(!normalized.contains("count(i_linux.RootfsPropagation) == 0"));
-    }
-
-    #[test]
-    fn allows_kata_overlay_shared_container_rootfs_paths() {
-        let policy = r#"policy_data := {
-  "common": {
-    "root_path": "/run/kata-containers/$(bundle-id)/rootfs"
-  }
-}
-"#;
-
-        let normalized = normalize_cap_generated_policy(policy);
-
-        assert!(normalized.contains(
-            r#""root_path": "/run/kata-containers/(?:shared/containers/)?$(bundle-id)/rootfs""#
-        ));
-        assert!(!normalized.contains(r#""root_path": "/run/kata-containers/$(bundle-id)/rootfs""#));
     }
 
     #[test]
