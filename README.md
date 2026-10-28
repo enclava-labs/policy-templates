@@ -89,11 +89,12 @@ under `/etc/genpolicy`; override `GENPOLICY_BIN`, `GENPOLICY_RULES_PATH`, or
 `ALLOW_RAW_POLICY_SIGNING_KEY_B64`, or `ALLOW_EPHEMERAL_SIGNING_KEY` outside
 local tests.
 
-cap-test01 currently records the live Kata runtime source as
-`kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596`.
-The Dockerfile verifies the matching
-`kata-tools-static-3.28.0-amd64.tar.zst` digest
-`825dbf929dc5fe3f77d1a473511fd8950f08b5f81b33803c79085dbc233ab94b` and copies
+The platform records the live Kata runtime source as
+`kata-containers/genpolicy@4.3.1+03cf2ec06a5d302f23af811744f6bcea49988bfb`
+(set this as `GENPOLICY_VERSION_PIN`; the SNP workers must run the matching
+Kata release). The Dockerfile verifies the matching
+`kata-tools-static-4.3.1-amd64.tar.zst` digest
+`511262aadef2a8596355733e448b65f7c871f4c6118b44ef7eb18afc19a5c0dd` and copies
 `genpolicy` from that archive.
 
 Minimal Kubernetes scaffolding lives in

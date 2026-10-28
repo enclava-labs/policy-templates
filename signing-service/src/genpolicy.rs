@@ -20,11 +20,11 @@ const KATA_HYPERVISOR_CC_INIT_DATA_ANNOTATION: &str =
     "io.katacontainers.config.hypervisor.cc_init_data";
 const KATA_RUNTIME_CC_INIT_DATA_ANNOTATION: &str = "io.katacontainers.config.runtime.cc_init_data";
 const DEFAULT_KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
-// Tiny pinned public image used wherever tests need a registry-resolvable ref
+// Pinned public image used wherever tests need a registry-resolvable ref
 // (content-addressed: stable forever, anonymous pulls fine).
-const SIZE_CLASS_IMAGE_REPO: &str = "index.docker.io/library/busybox";
+const SIZE_CLASS_IMAGE_REPO: &str = "index.docker.io/library/debian";
 const SIZE_CLASS_IMAGE_DIGEST: &str =
-    "sha256:b7f3d86d6e84fc17718c48bcde1450807faa2d56704205c697b4bd5df7b9e29f";
+    "sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3";
 const DEFAULT_ATTESTATION_PROXY_IMAGE_REPO: &str = "ghcr.io/enclava-labs/attestation-proxy";
 const CADDY_INGRESS_IMAGE_REPO: &str = "ghcr.io/enclava-labs/caddy-ingress";
 
@@ -816,7 +816,10 @@ fn render_pod_manifest(
             "shareProcessNamespace": true,
             "securityContext": {
                 "fsGroup": 10001,
-                "supplementalGroups": [6],
+                // genpolicy 4.3.1 (guest_pull) always encodes the default GID 0 in
+                // AdditionalGids and refuses generation unless the pod spec can
+                // reproduce it in-guest.
+                "supplementalGroups": [0, 6],
             },
             "initContainers": [
                 enclava_tools_container(log_encryption.is_some())?,
@@ -3339,10 +3342,10 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     // Generator-growth detector: the deploy-side caps are sized to this policy class
     // (API-side `MAX_POLICY_TEXT_BYTES` 160 KiB JSON-escaped and the composed
-    // proof-bundle budget 196,608; live baseline ~116-117 KiB raw, 113,601 B measured
-    // here with the stand-in image on genpolicy 3.28.0). A genpolicy, rules, or
-    // settings change that grows the output must fail here first: coordinate the
-    // deploy-side caps, then raise this bound in the same change.
+    // proof-bundle budget 196,608; ~89-91 KiB raw measured on genpolicy 4.3.1 with
+    // the stand-in image during the upgrade audit; CI prints exact sizes). A
+    // genpolicy, rules, or settings change that grows the output must fail here
+    // first: coordinate the deploy-side caps, then raise this bound in the same change.
     const GENERATED_POLICY_SIZE_CLASS_MAX_BYTES: usize = 128 * 1024;
     const GENERATED_POLICY_SIZE_CLASS_MIN_BYTES: usize = 64 * 1024;
 

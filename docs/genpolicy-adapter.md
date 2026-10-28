@@ -25,13 +25,19 @@ and before signing the KBS policy artifact. A failed `genpolicy` invocation
 rejects the signing request.
 
 The platform genpolicy pin is
-`kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596`,
+`kata-containers/genpolicy@4.3.1+03cf2ec06a5d302f23af811744f6bcea49988bfb`,
 which must match the Kata shim version running on the SNP workers. Changing
 the generator also changes signed workload policy hashes.
 The Dockerfile verifies and extracts `genpolicy` from
-`kata-tools-static-3.28.0-amd64.tar.zst` with digest
-`825dbf929dc5fe3f77d1a473511fd8950f08b5f81b33803c79085dbc233ab94b`, along
+`kata-tools-static-4.3.1-amd64.tar.zst` with digest
+`511262aadef2a8596355733e448b65f7c871f4c6118b44ef7eb18afc19a5c0dd`, along
 with the matching `rules.rego` and settings files.
+
+genpolicy 4.3.1 hard-fails generation under `guest_pull` when a container's
+expected user/groups are not fully declared in the Kubernetes manifest; the
+rendered pod therefore declares `supplementalGroups: [0, 6]`, and images
+whose user database grants extra groups (e.g. alpine `wheel`) are rejected
+with an actionable error instead of producing an unreproducible policy.
 
 Source contract checked while implementing: Kata documents `genpolicy -y
 test.yaml` and optional settings via `-j` for settings directories:
