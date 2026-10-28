@@ -476,64 +476,7 @@ fn remove_service_account_token_mounts(settings: &mut Value) {
 }
 
 fn normalize_cap_generated_policy(policy_text: &str) -> String {
-    let mut lines = policy_text
-        .split_inclusive('\n')
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    let mut idx = 0;
-
-    while idx < lines.len() {
-        if !lines[idx].contains("\"User\": {") {
-            idx += 1;
-            continue;
-        }
-
-        let mut user_end = idx;
-        let mut uid = None;
-        let mut gids_start = None;
-        let mut gids_end = None;
-
-        idx += 1;
-        while idx < lines.len() {
-            let trimmed = lines[idx].trim();
-            if let Some(raw_uid) = trimmed
-                .strip_prefix("\"UID\": ")
-                .and_then(|value| value.trim_end_matches(',').parse::<u32>().ok())
-            {
-                uid = Some(raw_uid);
-            }
-            if trimmed == "\"AdditionalGids\": [" {
-                gids_start = Some(idx);
-                let mut end = idx + 1;
-                while end < lines.len() {
-                    if lines[end].trim_start().starts_with(']') {
-                        gids_end = Some(end);
-                        break;
-                    }
-                    end += 1;
-                }
-            }
-            if trimmed.starts_with('}') {
-                user_end = idx;
-                break;
-            }
-            idx += 1;
-        }
-
-        if uid.is_some_and(|uid| uid != 0) {
-            if let (Some(start), Some(end)) = (gids_start, gids_end) {
-                let normalized_gids = normalized_additional_gids(&lines[(start + 1)..end]);
-                lines.splice((start + 1)..end, normalized_gids);
-                idx = start + 1;
-                continue;
-            }
-        }
-
-        idx = user_end + 1;
-    }
-
-    let normalized = lines.concat();
-    let normalized = normalize_cap_sandbox_pidns(&normalized);
+    let normalized = normalize_cap_sandbox_pidns(policy_text);
     let normalized = normalize_rootfs_propagation(&normalized);
     let normalized = normalize_cap_storage_mounts(&normalized);
     let normalized = normalize_cap_sandbox_storages(&normalized);
@@ -765,17 +708,6 @@ fn insert_policy_helper(policy_text: &str, helper: &str) -> String {
 
 fn normalize_privileged_caps_placeholder(policy_text: &str) -> String {
     policy_text.replace("\"CAP_$(privileged_caps)\"", "\"$(privileged_caps)\"")
-}
-
-fn normalized_additional_gids(group_lines: &[String]) -> Vec<String> {
-    group_lines
-        .iter()
-        .filter(|line| {
-            let trimmed = line.trim();
-            trimmed != "0" && trimmed != "0,"
-        })
-        .cloned()
-        .collect()
 }
 
 fn render_pod_manifest(
@@ -3262,69 +3194,6 @@ exit 101
         assert_eq!(mounts[0]["destination"], "/etc/hosts");
         let destinations = settings["mount_destinations"].as_array().unwrap();
         assert_eq!(destinations, &[json!("/etc/hosts")]);
-    }
-
-    #[test]
-    fn removes_root_supplemental_group_from_non_root_generated_users() {
-        let policy = r#"policy_data := {
-  "containers": [
-    {
-      "OCI": {
-        "Process": {
-          "User": {
-            "UID": 65532,
-            "GID": 65532,
-            "AdditionalGids": [
-              0,
-              6,
-              10001,
-              65532
-            ],
-            "Username": ""
-          }
-        }
-      }
-    },
-    {
-      "OCI": {
-        "Process": {
-          "User": {
-            "UID": 0,
-            "GID": 0,
-            "AdditionalGids": [
-              0,
-              6,
-              10001
-            ],
-            "Username": ""
-          }
-        }
-      }
-    }
-  ]
-}
-"#;
-
-        let normalized = normalize_cap_generated_policy(policy);
-
-        assert!(normalized.contains(
-            r#""UID": 65532,
-            "GID": 65532,
-            "AdditionalGids": [
-              6,
-              10001,
-              65532
-            ]"#
-        ));
-        assert!(normalized.contains(
-            r#""UID": 0,
-            "GID": 0,
-            "AdditionalGids": [
-              0,
-              6,
-              10001
-            ]"#
-        ));
     }
 
     #[test]
