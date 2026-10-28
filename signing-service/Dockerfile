@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS kata-tools
-ARG KATA_TOOLS_VERSION=3.28.0
-ARG KATA_TOOLS_SHA256=825dbf929dc5fe3f77d1a473511fd8950f08b5f81b33803c79085dbc233ab94b
+ARG KATA_TOOLS_VERSION=4.3.1
+ARG KATA_TOOLS_SHA256=511262aadef2a8596355733e448b65f7c871f4c6118b44ef7eb18afc19a5c0dd
 ADD --checksum=sha256:${KATA_TOOLS_SHA256} \
     https://github.com/kata-containers/kata-containers/releases/download/${KATA_TOOLS_VERSION}/kata-tools-static-${KATA_TOOLS_VERSION}-amd64.tar.zst \
     /tmp/kata-tools.tar.zst
