@@ -17,7 +17,7 @@ RUN set -eux; \
       ./opt/kata/share/defaults/kata-containers/genpolicy-settings.json \
       ./opt/kata/share/defaults/kata-containers/genpolicy-settings.d
 
-FROM rust:1.99-bookworm@sha256:5c1a1732ac3f77635b24d397ceb67b4d9ea61de348f68c0aa54a79fd01e65c69 AS builder
+FROM rust:1.99-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3 AS builder
 ARG BUILD_PROFILE=debug
 WORKDIR /workspace
 
@@ -48,11 +48,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       exit 1; \
     fi
 
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get upgrade -y; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd --system --gid 65532 signing-service; \
     useradd --system --uid 65532 --gid 65532 --home-dir /nonexistent --shell /usr/sbin/nologin signing-service; \
