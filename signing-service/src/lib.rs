@@ -1,3 +1,4 @@
+pub mod authorization;
 pub mod canonical;
 pub mod descriptor;
 pub mod genpolicy;
