@@ -1,9 +1,9 @@
 # Owner Bootstrap and Rotation
 
-This is a legacy transitional flow. Production signing-service deployments do
-not register `/bootstrap-org`, `/rotate-owner`, or `/sign`; those routes require
-both `ENABLE_PLATFORM_POLICY_SIGNING=1` and
-`SIGNING_SERVICE_ENABLE_LEGACY_OWNER_API=1`.
+This is the receipt-mode owner authority flow. Production signing-service
+deployments register the bearer-protected `/bootstrap-org`, `/rotate-owner`,
+and `/sign` routes when `ENABLE_PLATFORM_POLICY_SIGNING=1`. The owner database
+is an independent trust store and must not be reconstructed from CAP state.
 
 ## Bootstrap
 
@@ -58,6 +58,16 @@ Request:
 Threshold-of-owners and recovery-contact rotation are still external workflow
 work. The service-side primitive is durable and signature-checked, but v1 local
 tests cover a single current-owner signature only.
+
+## Backup And Restore
+
+Back up `OWNER_DB_PATH` with a SQLite-consistent snapshot that includes the WAL
+state. Retain backups beyond the longest CAP rollback window. A restore drill
+must verify the latest owner version, the append-only owner event history, and
+exact signing-result replay before the service is returned to traffic. CAP and
+the signing service are restored independently; if their latest owner
+fingerprints disagree, signing remains fail-closed until an audited recovery
+decision is made.
 
 ## M5 Mode
 

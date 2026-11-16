@@ -13,6 +13,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_policy_signing_service::{
+    authorization::{issue_authorization, verify_issued_authorization, AuthorizationInputs},
     canonical::ce_v1_bytes,
     genpolicy::GenpolicyConfig,
     owner_store::{BootstrapOutcome, OwnerStore},
@@ -42,6 +43,13 @@ struct AppState {
 #[derive(Clone)]
 struct ServiceAuth {
     token_hashes: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SignResponse {
+    #[serde(flatten)]
+    artifact: SignedPolicyArtifact,
+    deployment_authorization_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,8 +135,8 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let legacy_owner_api_enabled = legacy_owner_api_enabled(platform_policy_signing_enabled);
-    let owner_store = if legacy_owner_api_enabled {
+    let authorization_api_enabled = platform_policy_signing_enabled;
+    let owner_store = if authorization_api_enabled {
         let owner_db_path =
             env::var("OWNER_DB_PATH").unwrap_or_else(|_| "owner-state.sqlite3".into());
         Some(Arc::new(OwnerStore::open(PathBuf::from(owner_db_path))?))
@@ -147,7 +155,7 @@ async fn main() -> Result<()> {
     };
 
     let mut protected_routes = Router::new().route("/agent-policy", post(generate_agent_policy));
-    if legacy_owner_api_enabled {
+    if authorization_api_enabled {
         protected_routes = protected_routes
             .route("/sign", post(sign_policy))
             .route("/bootstrap-org", post(bootstrap_org))
@@ -155,7 +163,7 @@ async fn main() -> Result<()> {
             .route(OWNER_STATUS_ROUTE, get(owner_status));
     } else {
         tracing::info!(
-            "legacy platform signing and owner bootstrap routes are disabled; serving /agent-policy only"
+            "receipt signing and owner registry APIs are disabled; serving /agent-policy only"
         );
     }
     let protected_routes = protected_routes
@@ -226,7 +234,7 @@ async fn generate_agent_policy(
 async fn sign_policy(
     State(state): State<AppState>,
     Json(req): Json<SignRequest>,
-) -> Result<Json<SignedPolicyArtifact>, AppError> {
+) -> Result<Response, AppError> {
     let key_material = state.key_material.as_ref().ok_or_else(|| {
         anyhow!(
             "platform policy signing is disabled; submit a customer-signed policy artifact instead"
@@ -243,7 +251,25 @@ async fn sign_policy(
         .as_ref()
         .ok_or_else(|| anyhow!("legacy owner API is disabled"))?
         .require_owner(blobs.descriptor_envelope.descriptor.org_id)?;
+    let descriptor_envelope = blobs.descriptor_envelope.clone();
+    let keyring_envelope = blobs.keyring_envelope.clone();
     let inputs = verify_signing_inputs(blobs, &owner.owner_pubkey)?;
+    if req.app_id != inputs.descriptor.app_id
+        || req.deploy_id != inputs.descriptor.deploy_id
+        || req.platform_release_version != inputs.descriptor.platform_release_version
+    {
+        return Err(AppError(anyhow!(
+            "request identifiers do not match signed descriptor"
+        )));
+    }
+    if let Some(stored) = state
+        .owner_store
+        .as_ref()
+        .expect("owner store checked above")
+        .get_signing_result(&inputs.descriptor_core_hash)?
+    {
+        return json_bytes_response(stored);
+    }
     let generated_agent_policy = state
         .genpolicy
         .run_with_log_encryption(&inputs.descriptor, req.log_encryption.as_ref())?;
@@ -253,26 +279,62 @@ async fn sign_policy(
         policy_bytes = generated_agent_policy.policy_text.len(),
         "generated Kata agent policy from verified deployment descriptor"
     );
+    let issued_at = Utc::now();
     let artifact = sign_verified_policy(
         &req,
         inputs,
         generated_agent_policy,
         key_material,
-        Utc::now(),
+        issued_at,
     )?;
     let verify_key = key_material.signing_key.verifying_key();
     verify_signed_artifact(&artifact, &verify_key)?;
-    Ok(Json(artifact))
+    let (authorization, authorization_bytes) = issue_authorization(
+        AuthorizationInputs {
+            descriptor_envelope: &descriptor_envelope,
+            keyring_envelope: &keyring_envelope,
+            owner_version: owner.version,
+            owner_pubkey: &owner.owner_pubkey.to_bytes(),
+            artifact: &artifact,
+        },
+        key_material,
+        issued_at,
+    )?;
+    verify_issued_authorization(&authorization, &key_material.signing_key)?;
+    let bundle_digest: [u8; 32] = hex::decode(&authorization.artifact_bundle_digest)?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow!("bundle digest is {} bytes", bytes.len()))?;
+    let response = serde_json::to_vec(&SignResponse {
+        artifact,
+        deployment_authorization_b64: B64.encode(authorization_bytes),
+    })?;
+    let stored = state
+        .owner_store
+        .as_ref()
+        .expect("owner store checked above")
+        .store_signing_result(
+            &enclava_policy_signing_service::descriptor::descriptor_core_hash(
+                &descriptor_envelope.descriptor,
+            ),
+            &bundle_digest,
+            &response,
+            issued_at,
+        )?;
+    json_bytes_response(stored)
+}
+
+fn json_bytes_response(bytes: Vec<u8>) -> Result<Response, AppError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|err| AppError(anyhow!("building signer response: {err}")))
 }
 
 fn env_flag(name: &str) -> bool {
     env::var(name)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
-}
-
-fn legacy_owner_api_enabled(platform_policy_signing_enabled: bool) -> bool {
-    platform_policy_signing_enabled && env_flag("SIGNING_SERVICE_ENABLE_LEGACY_OWNER_API")
 }
 
 impl ServiceAuth {
@@ -653,13 +715,5 @@ mod tests {
         };
         let req = Request::builder().body(Body::empty()).unwrap();
         assert!(auth.authorizes(&req));
-    }
-
-    #[test]
-    fn legacy_owner_api_is_disabled_by_default_even_with_platform_key_material() {
-        std::env::remove_var("SIGNING_SERVICE_ENABLE_LEGACY_OWNER_API");
-
-        assert!(!legacy_owner_api_enabled(true));
-        assert!(!legacy_owner_api_enabled(false));
     }
 }
