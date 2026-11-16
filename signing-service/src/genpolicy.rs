@@ -803,6 +803,9 @@ fn cap_runtime_annotations(descriptor: &DeploymentDescriptor) -> BTreeMap<&'stat
             SMALL_VM_BASELINE_MIB.to_string(),
         );
     }
+    if let Some(baseline) = vm_vcpu_baseline_annotation(descriptor) {
+        annotations.insert(KATA_DEFAULT_VCPUS_ANNOTATION, baseline);
+    }
     annotations
 }
 
@@ -1100,6 +1103,103 @@ fn resources(
 const STANDARD_APP_REQUEST_MIB: f64 = 512.0;
 const SMALL_VM_BASELINE_MIB: &str = "1536";
 const KATA_DEFAULT_MEMORY_ANNOTATION: &str = "io.katacontainers.config.hypervisor.default_memory";
+
+const KATA_DEFAULT_VCPUS_ANNOTATION: &str = "io.katacontainers.config.hypervisor.default_vcpus";
+const COCO_DEV_RUNTIME_CLASS: &str = "kata-qemu-coco-dev";
+/// Kata's baseline vCPU count (`default_vcpus`) for the SNP handler.
+const KATA_BASELINE_VCPU_MILLIS: u64 = 1000;
+/// The vCPU count whose SNP launch measurement the platform approves.
+const APPROVED_SNP_VM_VCPUS: u64 = 4;
+/// Summed CPU limit of the platform containers rendered below:
+/// attestation-proxy and tenant-ingress (`sidecar_resources`) and enclava-init.
+///
+/// CAP's own derivation also has a legacy bootstrap layout without the
+/// enclava-init sidecar (1000m). That layout is deliberately not mirrored:
+/// this manifest always renders enclava-init, so a cluster running CAP with
+/// `LEGACY_BOOTSTRAP_SCRIPT` cannot use this genpolicy path at all. Do not
+/// add a legacy switch here without rendering the legacy pod as well.
+const PLATFORM_CONTAINER_CPU_LIMIT_MILLIS: u64 = 1500;
+
+/// A CPU quantity (`250m`, `1`, `1.5`) in millicores, rounded up to the next
+/// whole millicore as Kubernetes rounds a container limit. Mirrors CAP's
+/// `manifest::shape::cpu_quantity_millis`.
+fn cpu_quantity_millis(value: &str) -> Option<u64> {
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
+    let (number, millis_per_unit) = match value.strip_suffix('m') {
+        Some(number) => (number, 1u64),
+        None => (value, 1000u64),
+    };
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().ok()?
+    };
+    let mut millis = whole.checked_mul(millis_per_unit)?;
+    let kept_digits = if millis_per_unit == 1000 { 3 } else { 0 };
+    let mut scale = millis_per_unit;
+    let mut round_up = false;
+    for (index, digit) in fraction.bytes().enumerate() {
+        let digit = u64::from(digit - b'0');
+        if index < kept_digits {
+            scale /= 10;
+            millis = millis.checked_add(digit * scale)?;
+        } else if digit != 0 {
+            round_up = true;
+        }
+    }
+    if round_up {
+        millis = millis.checked_add(1)?;
+    }
+    Some(millis)
+}
+
+fn app_cpu_limit_millis(descriptor: &DeploymentDescriptor) -> Option<u64> {
+    descriptor
+        .oci_runtime_spec
+        .resources
+        .limits
+        .iter()
+        .find(|entry| entry.name == "cpu")
+        .and_then(|entry| cpu_quantity_millis(&entry.value))
+}
+
+/// Mirrors CAP's `manifest::shape::vm_vcpu_baseline_annotation`: an app CPU
+/// limit that would boot fewer vCPUs than the approved count gets a Kata
+/// `default_vcpus` baseline that brings baseline plus pod limits to 3.5,
+/// which Kata rounds to four. CAP renders this annotation on the pod, and the
+/// generated agent policy rejects any annotation it did not see here, so the
+/// derivation must stay identical on both sides.
+fn vm_vcpu_baseline_annotation(descriptor: &DeploymentDescriptor) -> Option<String> {
+    if descriptor.expected_runtime_class == COCO_DEV_RUNTIME_CLASS {
+        return None;
+    }
+    let pod = PLATFORM_CONTAINER_CPU_LIMIT_MILLIS.checked_add(app_cpu_limit_millis(descriptor)?)?;
+    let unpadded_vcpus = KATA_BASELINE_VCPU_MILLIS.checked_add(pod)?.div_ceil(1000);
+    if unpadded_vcpus >= APPROVED_SNP_VM_VCPUS {
+        return None;
+    }
+    let millis = APPROVED_SNP_VM_VCPUS * 1000 - 500 - pod;
+    let fraction = format!("{:03}", millis % 1000);
+    let fraction = fraction.trim_end_matches('0');
+    Some(if fraction.is_empty() {
+        (millis / 1000).to_string()
+    } else {
+        format!("{}.{fraction}", millis / 1000)
+    })
+}
 
 fn memory_limit_mib(value: &str) -> Option<f64> {
     let trimmed = value.trim();
@@ -2407,6 +2507,101 @@ exit 101
         let container = attestation_proxy_container(&big).unwrap();
         let yaml = serde_yaml::to_string(&container).unwrap();
         assert!(yaml.contains("memory: 256Mi"));
+    }
+
+    fn descriptor_with_cpu_limit(cpu: &str) -> DeploymentDescriptor {
+        let mut descriptor = small_descriptor();
+        descriptor.oci_runtime_spec.resources.limits[0].value = cpu.to_string();
+        descriptor.oci_runtime_spec.resources.limits[1].value = "512Mi".to_string();
+        descriptor.expected_runtime_class = "kata-qemu-snp".to_string();
+        descriptor
+    }
+
+    #[test]
+    fn low_cpu_manifest_carries_cap_vcpu_baseline_annotation() {
+        // cap#392: CAP pads a low-CPU pod to the approved vCPU count with the
+        // Kata default_vcpus annotation. The agent policy rejects annotations
+        // missing from this manifest, so it must carry the same key and value.
+        for (cpu, baseline) in [
+            ("0.5", "1.5"),
+            ("500m", "1.5"),
+            ("250m", "1.75"),
+            ("100m", "1.9"),
+            ("1m", "1.999"),
+        ] {
+            let descriptor = descriptor_with_cpu_limit(cpu);
+            let annotations = cap_runtime_annotations(&descriptor);
+            assert_eq!(
+                annotations
+                    .get(KATA_DEFAULT_VCPUS_ANNOTATION)
+                    .map(String::as_str),
+                Some(baseline),
+                "cpu={cpu}"
+            );
+        }
+
+        let config = GenpolicyConfig {
+            binary: PathBuf::from("/opt/kata/bin/genpolicy"),
+            version_pin: "kata-containers-3.12.0".to_string(),
+            rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
+            settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
+        };
+        let invocation = config
+            .build_invocation(&descriptor_with_cpu_limit("100m"))
+            .unwrap();
+        assert!(
+            invocation
+                .manifest_yaml
+                .contains("io.katacontainers.config.hypervisor.default_vcpus: '1.9'"),
+            "{}",
+            invocation.manifest_yaml
+        );
+    }
+
+    /// CAP renders the annotation on the real pod and checks its own
+    /// implementation against the same vector file
+    /// (`crates/enclava-engine/tests/fixtures/` in enclava-labs/cap). The
+    /// two copies are kept byte-identical, so a one-sided change to the
+    /// arithmetic fails here instead of at deploy time.
+    #[test]
+    fn vcpu_baseline_annotation_matches_cap_golden_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/cap-vm-vcpu-baseline-vectors.json"
+        ))
+        .expect("golden vector fixture is valid JSON");
+        let vectors = fixture["vectors"].as_array().expect("vectors array");
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let cpu_limit = vector["cpu_limit"].as_str().expect("cpu_limit string");
+            let expected = vector["default_vcpus"].as_str();
+            let annotations = cap_runtime_annotations(&descriptor_with_cpu_limit(cpu_limit));
+            assert_eq!(
+                annotations
+                    .get(KATA_DEFAULT_VCPUS_ANNOTATION)
+                    .map(String::as_str),
+                expected,
+                "cpu_limit={cpu_limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_cpu_manifest_keeps_existing_annotations() {
+        // Limits the runtime baseline already sizes to the approved count,
+        // limits above it, unparseable limits and the unmeasured dev class
+        // all render exactly as before.
+        for cpu in ["501m", "1", "1.5", "2", "bogus"] {
+            let annotations = cap_runtime_annotations(&descriptor_with_cpu_limit(cpu));
+            assert!(
+                !annotations.contains_key(KATA_DEFAULT_VCPUS_ANNOTATION),
+                "cpu={cpu}"
+            );
+        }
+        assert!(!cap_runtime_annotations(&fixed_descriptor())
+            .contains_key(KATA_DEFAULT_VCPUS_ANNOTATION));
+        let mut dev = descriptor_with_cpu_limit("100m");
+        dev.expected_runtime_class = COCO_DEV_RUNTIME_CLASS.to_string();
+        assert!(!cap_runtime_annotations(&dev).contains_key(KATA_DEFAULT_VCPUS_ANNOTATION));
     }
 
     fn duplicate_limits_descriptor() -> DeploymentDescriptor {
