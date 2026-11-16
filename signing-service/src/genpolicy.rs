@@ -1112,6 +1112,12 @@ const KATA_BASELINE_VCPU_MILLIS: u64 = 1000;
 const APPROVED_SNP_VM_VCPUS: u64 = 4;
 /// Summed CPU limit of the platform containers rendered below:
 /// attestation-proxy and tenant-ingress (`sidecar_resources`) and enclava-init.
+///
+/// CAP's own derivation also has a legacy bootstrap layout without the
+/// enclava-init sidecar (1000m). That layout is deliberately not mirrored:
+/// this manifest always renders enclava-init, so a cluster running CAP with
+/// `LEGACY_BOOTSTRAP_SCRIPT` cannot use this genpolicy path at all. Do not
+/// add a legacy switch here without rendering the legacy pod as well.
 const PLATFORM_CONTAINER_CPU_LIMIT_MILLIS: u64 = 1500;
 
 /// A CPU quantity (`250m`, `1`, `1.5`) in millicores, rounded up to the next
@@ -2550,6 +2556,33 @@ exit 101
             "{}",
             invocation.manifest_yaml
         );
+    }
+
+    /// CAP renders the annotation on the real pod and checks its own
+    /// implementation against the same vector file
+    /// (`crates/enclava-engine/tests/fixtures/` in enclava-labs/cap). The
+    /// two copies are kept byte-identical, so a one-sided change to the
+    /// arithmetic fails here instead of at deploy time.
+    #[test]
+    fn vcpu_baseline_annotation_matches_cap_golden_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/cap-vm-vcpu-baseline-vectors.json"
+        ))
+        .expect("golden vector fixture is valid JSON");
+        let vectors = fixture["vectors"].as_array().expect("vectors array");
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let cpu_limit = vector["cpu_limit"].as_str().expect("cpu_limit string");
+            let expected = vector["default_vcpus"].as_str();
+            let annotations = cap_runtime_annotations(&descriptor_with_cpu_limit(cpu_limit));
+            assert_eq!(
+                annotations
+                    .get(KATA_DEFAULT_VCPUS_ANNOTATION)
+                    .map(String::as_str),
+                expected,
+                "cpu_limit={cpu_limit}"
+            );
+        }
     }
 
     #[test]
