@@ -213,7 +213,8 @@ async fn generate_agent_policy(
     }
     let generated = state
         .genpolicy
-        .run_with_log_encryption(&req.descriptor, req.log_encryption.as_ref())?;
+        .run_with_log_encryption(&req.descriptor, req.log_encryption.as_ref())
+        .await?;
     let agent_policy_sha256 = hex::encode(Sha256::digest(generated.policy_text.as_bytes()));
     Ok(Json(AgentPolicyResponse {
         agent_policy_text: generated.policy_text,
@@ -246,7 +247,8 @@ async fn sign_policy(
     let inputs = verify_signing_inputs(blobs, &owner.owner_pubkey)?;
     let generated_agent_policy = state
         .genpolicy
-        .run_with_log_encryption(&inputs.descriptor, req.log_encryption.as_ref())?;
+        .run_with_log_encryption(&inputs.descriptor, req.log_encryption.as_ref())
+        .await?;
     tracing::info!(
         genpolicy_version = %generated_agent_policy.invocation.version_pin,
         manifest_bytes = generated_agent_policy.invocation.manifest_yaml.len(),
