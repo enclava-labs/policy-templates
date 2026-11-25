@@ -39,8 +39,22 @@ fn main() -> Result<()> {
         bail!("artifact signing key must match descriptor_signing_pubkey");
     }
 
-    let generated_agent_policy =
-        runtime.block_on(async { GenpolicyConfig::from_env().run(&inputs.descriptor).await })?;
+    // Drive the generation with Ctrl-C routed through the subprocess
+    // cleanup path (Devin T2): on SIGINT the generation future is
+    // dropped, which drops the Child (kill_on_drop) AND fires the
+    // process-group guard's Drop — the child and its helpers are
+    // TERMed before the CLI exits with an interrupted status.
+    let generation = async { GenpolicyConfig::from_env().run(&inputs.descriptor).await };
+    let generated_agent_policy = runtime.block_on(async {
+        tokio::select! {
+            result = generation => result,
+            _ = tokio::signal::ctrl_c() => {
+                // Give the dropped-future cleanup a beat to TERM the group.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                bail!("interrupted: genpolicy terminated (process group TERMed)");
+            }
+        }
+    })?;
     let signed_at = args
         .signed_at
         .map(|value| DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)))

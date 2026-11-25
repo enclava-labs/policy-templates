@@ -194,6 +194,12 @@ pub struct GenpolicyConfig {
     pub version_pin: String,
     pub rules_path: PathBuf,
     pub settings_dir: Option<PathBuf>,
+    /// Maximum CONCURRENT genpolicy steps this process runs. The old
+    /// blocking call implicitly capped concurrency at the worker-thread
+    /// count; the async runner needs an explicit cap so concurrent /sign
+    /// requests cannot each start a generator under the same container
+    /// limits (500m CPU / 512Mi, deploy/kubernetes.yaml). Default 2.
+    pub max_concurrent: usize,
     /// Hard TOTAL budget for one genpolicy step (both attempts together).
     /// 90 s sits under cap's 120 s signing client timeout
     /// (PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS) with room for the rest of
@@ -234,6 +240,7 @@ impl GenpolicyConfig {
             rules_path: PathBuf::from(rules_path),
             settings_dir,
             total_budget: DEFAULT_GENPOLICY_TOTAL_BUDGET,
+            max_concurrent: DEFAULT_GENPOLICY_MAX_CONCURRENT,
         }
     }
 
@@ -286,6 +293,12 @@ impl GenpolicyConfig {
         descriptor: &DeploymentDescriptor,
         log_encryption: Option<&LogEncryptionConfig>,
     ) -> Result<GeneratedAgentPolicy> {
+        // Explicit concurrency cap: waiting requests queue here instead of
+        // each starting a generator under the same container limits
+        // (Devin T5).
+        static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        let semaphore = PERMITS
+            .get_or_init(|| tokio::sync::Semaphore::new(std::cmp::max(1, self.max_concurrent)));
         let invocation = self.build_invocation_with_log_encryption(descriptor, log_encryption)?;
         let dir = tempfile::tempdir().context("creating genpolicy work dir")?;
         let manifest_path = dir.path().join("pod.yaml");
@@ -310,7 +323,14 @@ impl GenpolicyConfig {
             args.push(settings_dir.display().to_string());
         }
 
-        let output = run_genpolicy(&self.binary, &args, dir.path(), self.total_budget).await?;
+        let output = run_genpolicy(
+            &self.binary,
+            &args,
+            dir.path(),
+            self.total_budget,
+            Some(semaphore),
+        )
+        .await?;
         if !output.status.success() {
             bail!(
                 "genpolicy failed with status {}: {}",
@@ -411,6 +431,9 @@ fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String>
 /// The production genpolicy budget (see `GenpolicyConfig::total_budget`).
 pub const DEFAULT_GENPOLICY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// The production concurrency cap (see `GenpolicyConfig::max_concurrent`).
+pub const DEFAULT_GENPOLICY_MAX_CONCURRENT: usize = 2;
+
 #[cfg(unix)]
 fn new_command(binary: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(binary);
@@ -429,29 +452,61 @@ fn new_command(binary: &Path) -> tokio::process::Command {
 /// Kill the child's whole process group (the child plus any helpers it
 /// spawned). Best effort: failures are logged, never fatal — the budget
 /// error is the answer either way.
+/// TERminate the child's whole process group via the OS API — no external
+/// `kill` executable (the shipped image does not carry one; Devin T1) and
+/// no async requirement, so it also works from a Drop guard on any
+/// cancellation path. Best effort: failures are logged, never fatal.
+fn term_process_group_by_pid(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // Negative pid = the process group; SIGTERM matches the kill(1)
+        // default. The direct child is additionally covered by kill_on_drop.
+        let result = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
+        if result != 0 {
+            tracing::warn!(
+                pid,
+                errno = std::io::Error::last_os_error().raw_os_error(),
+                "process-group TERM failed; the direct child is still covered by kill_on_drop"
+            );
+            return false;
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// RAII group guard: whatever cancels the attempt future — the budget, a
+/// Ctrl-C drop in the CLI, a panic — TERMinates the child's process group
+/// synchronously, so helpers the child spawned cannot outlive the step
+/// (Devin T2). Disarmed on successful completion.
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn disarm(mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            term_process_group_by_pid(pid);
+        }
+    }
+}
+
 async fn kill_process_group_by_pid(pid: Option<u32>, attempt: u8) {
     let Some(pid) = pid else {
         return;
     };
-    // kill_on_drop already terminates the direct child when the Child is
-    // dropped inside the timed-out future; the group TERM covers helpers
-    // the child spawned. Best effort: failures are logged, never fatal —
-    // the budget error is the answer either way.
-    let kill = tokio::process::Command::new("kill")
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .output()
-        .await;
-    if let Ok(output) = &kill {
-        if !output.status.success() {
-            tracing::warn!(
-                pid,
-                attempt,
-                status = ?output.status,
-                "process-group TERM failed; the direct child is covered by kill_on_drop"
-            );
-        }
-    }
+    let _ = attempt;
+    term_process_group_by_pid(pid);
 }
 
 /// One budgeted, non-blocking genpolicy attempt. INFO logs bracket every
@@ -491,8 +546,11 @@ async fn attempt_genpolicy(
         .spawn()
         .with_context(|| format!("executing genpolicy binary {}", binary.display()))?;
     // Capture the pid BEFORE the wait: `wait_with_output` consumes the
-    // Child, so the group kill on expiry works from the pid alone.
+    // Child, so the group kill on expiry works from the pid alone. The
+    // guard TERMs the group on ANY cancellation (budget, CLI Ctrl-C drop,
+    // panic), not only the timeout path.
     let pid = child.id();
+    let _guard = ProcessGroupGuard { pid };
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     match tokio::time::timeout(remaining, child.wait_with_output()).await {
         Ok(result) => {
@@ -507,6 +565,7 @@ async fn attempt_genpolicy(
                 stderr_bytes = output.stderr.len(),
                 "genpolicy invocation finished"
             );
+            _guard.disarm();
             Ok(output)
         }
         Err(_) => {
@@ -527,7 +586,19 @@ async fn run_genpolicy(
     args: &[String],
     work_dir: &Path,
     total_budget: std::time::Duration,
+    permits: Option<&tokio::sync::Semaphore>,
 ) -> Result<Output> {
+    // The concurrency cap (if configured) is held across BOTH attempts of
+    // this step: one request, one generator slot (Devin T5).
+    let _permit = match permits {
+        Some(semaphore) => Some(
+            semaphore
+                .acquire()
+                .await
+                .context("genpolicy concurrency permits closed")?,
+        ),
+        None => None,
+    };
     let deadline = tokio::time::Instant::now() + total_budget;
     let output = attempt_genpolicy(binary, args, work_dir, None, deadline, 1, "configured").await?;
     if output.status.success() {
@@ -2373,6 +2444,7 @@ exit 101
                     &[],
                     work.path(),
                     std::time::Duration::from_secs(30),
+                    None,
                 )
                 .await
             })
@@ -2440,6 +2512,7 @@ exit 101
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
             total_budget: std::time::Duration::from_secs(30),
+            max_concurrent: 2,
         };
         let invocation = config.build_invocation(&fixed_descriptor()).unwrap();
 
@@ -2623,6 +2696,7 @@ exit 101
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
             total_budget: std::time::Duration::from_secs(30),
+            max_concurrent: 2,
         };
         let descriptor = small_descriptor();
         assert!(is_small_shape(&descriptor));
@@ -2694,6 +2768,7 @@ exit 101
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
             total_budget: std::time::Duration::from_secs(30),
+            max_concurrent: 2,
         };
         let invocation = config
             .build_invocation(&descriptor_with_cpu_limit("100m"))
@@ -2779,6 +2854,7 @@ exit 101
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: None,
             total_budget: std::time::Duration::from_secs(30),
+            max_concurrent: 2,
         };
         let descriptor = duplicate_limits_descriptor();
         let err = config.build_invocation(&descriptor).unwrap_err();
@@ -3536,6 +3612,7 @@ exit 101
             rules_path: PathBuf::from("rules.rego"),
             settings_dir: None,
             total_budget: std::time::Duration::from_secs(30),
+            max_concurrent: 2,
         };
         assert!(config.require_pinned_version().is_err());
     }
@@ -3833,6 +3910,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
                     &[],
                     work.path(),
                     std::time::Duration::from_millis(300),
+                    None,
                 )
                 .await
             })
@@ -3853,38 +3931,126 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     }
 
     #[tokio::test]
-    async fn healthz_style_work_answers_while_genpolicy_child_is_stalled() {
-        // (d2) The worker-parking proof: while a stalled genpolicy child
-        // is being waited on, the SAME runtime keeps answering async work
-        // (the /healthz shape — a constant response with no blocking
-        // dependency). Under the old std::process::output() call this
-        // hung; under tokio::process the wait yields.
+    async fn healthz_style_work_answers_during_the_stalled_child_wait() {
+        // (d2) DISCRIMINATING worker-parking proof: async work must make
+        // progress WHILE the stalled child is still being waited on, not
+        // after the generation future resolves. Sabotage-proven: with the
+        // wait swapped back to a blocking std call, this test goes RED
+        // (elapsed assertion) while the generation stalls.
         let work = tempfile::tempdir().unwrap();
-        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 5\n");
+        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 10\n");
         let genpolicy = async {
             run_genpolicy(
                 &binary,
                 &[],
                 work.path(),
-                std::time::Duration::from_millis(250),
+                std::time::Duration::from_secs(5),
+                None,
             )
             .await
         };
         let healthz = async {
-            let mut answered = 0;
-            for _ in 0..5 {
-                // The healthz handler's shape: constant JSON, no awaits
-                // on the child. If the genpolicy wait parked the only
-                // worker (single-threaded runtime!), these ticks would
-                // never run before the budget error.
+            let started = std::time::Instant::now();
+            let mut ticks = 0;
+            while ticks < 5 {
                 tokio::task::yield_now().await;
-                answered += 1;
+                ticks += 1;
             }
-            answered
+            (ticks, started.elapsed())
         };
-        let (result, answered) = tokio::join!(genpolicy, healthz);
+        let (result, (ticks, healthz_elapsed)) = tokio::join!(genpolicy, healthz);
         assert!(result.is_err(), "the stalled child hits the budget");
-        assert_eq!(answered, 5, "async work kept answering on the same runtime");
+        assert_eq!(ticks, 5);
+        assert!(
+            healthz_elapsed < std::time::Duration::from_secs(1),
+            "async work progressed DURING the wait (elapsed {healthz_elapsed:?}), not after it"
+        );
+    }
+
+    #[test]
+    fn budget_expiry_terminates_the_childs_spawned_helper() {
+        // (d1b / Devin T1): the group kill must reach helpers the child
+        // spawned, via the OS API (no `kill` executable exists in the
+        // shipped image). The fake genpolicy spawns a 60 s sleeper and
+        // reports its pid; after the budget the sleeper must be gone.
+        let work = tempfile::tempdir().unwrap();
+        let helper = work.path().join("helper.sh");
+        fs::write(&helper, "#!/bin/sh\nsleep 60\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let pid_file = work.path().join("helper.pid");
+        let binary = write_fake_genpolicy(
+            work.path(),
+            &format!(
+                "#!/bin/sh\nsh \"{help}\" &\necho $! > \"{pfile}\"\nsleep 30\n",
+                help = helper.display(),
+                pfile = pid_file.display(),
+            ),
+        );
+        let error = current_thread_runtime()
+            .block_on(async {
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    std::time::Duration::from_millis(400),
+                    None,
+                )
+                .await
+            })
+            .expect_err("budget must fire");
+        assert!(format!("{error:#}").contains("genpolicy timed out"));
+        let helper_pid: i32 = fs::read_to_string(&pid_file)
+            .expect("helper pid recorded")
+            .trim()
+            .parse()
+            .expect("helper pid numeric");
+        // Reap window for the TERM, then the helper must be gone: kill(0)
+        // fails with ESRCH once no such process exists.
+        let mut gone = false;
+        for _ in 0..50 {
+            let rc = unsafe { libc::kill(helper_pid, 0) };
+            if rc != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "the spawned helper was TERMed with the group");
+    }
+
+    #[test]
+    fn retry_does_not_reset_the_shared_budget() {
+        // (d4 / Devin T4): the deadline spans BOTH attempts. Attempt 1
+        // fails immediately; attempt 2 stalls; the total elapsed must stay
+        // near the single budget (a per-attempt reset would double it).
+        let work = tempfile::tempdir().unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            r#"#!/bin/sh
+case "$REGISTRY_AUTH_FILE" in
+  */anonymous-registry/config.json)
+    sleep 30
+    ;;
+esac
+exit 101
+"#,
+        );
+        let budget = std::time::Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let error = current_thread_runtime()
+            .block_on(async { run_genpolicy(&binary, &[], work.path(), budget, None).await })
+            .expect_err("the stalled retry must hit the SHARED budget");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("genpolicy timed out: attempt 2"),
+            "error names the retry attempt: {rendered}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < budget + budget.div_f32(2.0),
+            "total elapsed {elapsed:?} stays within ~1.5x the single budget {budget:?} — the deadline is shared, not reset"
+        );
     }
 
     #[test]
@@ -3913,11 +4079,46 @@ exit 101
                     &[],
                     work.path(),
                     std::time::Duration::from_secs(30),
+                    None,
                 )
                 .await
             })
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"anonymous policy");
+    }
+
+    #[tokio::test]
+    async fn concurrency_cap_queues_a_third_genpolicy_step() {
+        // (Devin T5): at most max_concurrent generator steps run at once;
+        // the third waits for a permit instead of starting under the same
+        // container limits.
+        let work = tempfile::tempdir().unwrap();
+        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 1\n");
+        let budget = std::time::Duration::from_secs(10);
+        let cap = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let binary = binary.clone();
+            let work_dir = work.path().to_path_buf();
+            let permits = cap.clone();
+            handles.push(tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let result = run_genpolicy(&binary, &[], &work_dir, budget, Some(&*permits)).await;
+                (result.is_ok(), started.elapsed())
+            }));
+        }
+        let mut overlaps = 0;
+        for handle in handles {
+            let (ok, elapsed) = handle.await.unwrap();
+            assert!(ok);
+            if elapsed >= std::time::Duration::from_secs(2) {
+                overlaps += 1;
+            }
+        }
+        assert!(
+            overlaps >= 1,
+            "at least one step queued behind the cap (took >= 2s while two 1s children held the permits)"
+        );
     }
 }
