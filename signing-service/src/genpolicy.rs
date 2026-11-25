@@ -329,6 +329,7 @@ impl GenpolicyConfig {
             dir.path(),
             self.total_budget,
             Some(semaphore),
+            &descriptor.image_ref,
         )
         .await?;
         if !output.status.success() {
@@ -479,6 +480,112 @@ fn term_process_group_by_pid(pid: u32) -> bool {
     }
 }
 
+/// Maximum child stdout/stderr bytes carried into a log tail
+/// (ADDENDUM 2: a fixed small bound).
+const OUTPUT_TAIL_MAX_BYTES: usize = 512;
+
+/// Credential byte strings that must never appear in a log tail: the
+/// registry auth config handed to the child (the file we wrote for the
+/// anonymous attempt, or the service's own REGISTRY_AUTH_FILE for the
+/// configured attempt). The pre-existing failure-body path keeps its own
+/// separate contract; this redaction governs LOG LINES ONLY.
+fn credential_secrets(env: Option<(&Path, &Path)>) -> Vec<Vec<u8>> {
+    let mut secrets = Vec::new();
+    let mut push_file = |path: &Path| {
+        if let Ok(bytes) = fs::read(path) {
+            if !bytes.is_empty() {
+                secrets.push(bytes);
+            }
+        }
+    };
+    match env {
+        Some((auth_file, _docker_dir)) => push_file(auth_file),
+        None => {
+            // The configured attempt inherits the service's own registry
+            // credentials from the environment (ghcr auth secret mount).
+            if let Ok(value) = std::env::var("REGISTRY_AUTH_FILE") {
+                push_file(Path::new(&value));
+            } else if let Ok(value) = std::env::var("DOCKER_CONFIG") {
+                push_file(&Path::new(&value).join("config.json"));
+            }
+        }
+    }
+    secrets
+}
+
+/// Byte-level `haystack[needle] -> replacement` (credential bytes need not
+/// be valid UTF-8).
+fn replace_bytes(mut haystack: Vec<u8>, needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return haystack;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(needle) {
+            out.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    haystack.clear();
+    haystack.extend_from_slice(&out);
+    haystack
+}
+
+/// Render a child stream tail for a log line: the LAST
+/// `OUTPUT_TAIL_MAX_BYTES` bytes, every known credential byte string
+/// replaced with `[redacted]`, newlines flattened so the tail stays on one
+/// log line.
+fn render_output_tail(bytes: &[u8], secrets: &[Vec<u8>]) -> String {
+    let start = bytes.len().saturating_sub(OUTPUT_TAIL_MAX_BYTES);
+    let mut tail = bytes[start..].to_vec();
+    for secret in secrets {
+        tail = replace_bytes(tail, secret, b"[redacted]");
+    }
+    String::from_utf8_lossy(&tail)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+/// Drain a piped child stream in its own task so the kill path still gets
+/// its bytes: EOF arrives when the TERMed process group closes the pipe,
+/// and the bounded grace below keeps a stuck reader from stalling the
+/// response.
+async fn drain_child_pipe<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut pipe: R,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf).await;
+    buf
+}
+
+/// Await an output reader with a small grace; on expiry the tail is
+/// logged as empty (never block the response on a helper that somehow
+/// kept the pipe open past the group TERM).
+async fn collect_child_output(reader: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    match reader {
+        None => Vec::new(),
+        Some(handle) => match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await
+        {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(join_error)) => {
+                tracing::warn!(%join_error, "genpolicy output reader task failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "genpolicy output reader did not finish within the grace window; logging an empty tail"
+                );
+                Vec::new()
+            }
+        },
+    }
+}
+
 /// RAII group guard: whatever cancels the attempt future — the budget, a
 /// Ctrl-C drop in the CLI, a panic — TERMinates the child's process group
 /// synchronously, so helpers the child spawned cannot outlive the step
@@ -511,8 +618,13 @@ async fn kill_process_group_by_pid(pid: Option<u32>, attempt: u8) {
 
 /// One budgeted, non-blocking genpolicy attempt. INFO logs bracket every
 /// invocation (attempt number, auth mode, exit status, duration,
-/// stdout/stderr BYTE counts — never contents); on expiry the process
-/// group is killed and the error names the attempt and the elapsed time.
+/// stdout/stderr byte counts, and a small REDACTED TAIL of each stream —
+/// ADDENDUM 2); on expiry the process group is killed, a WARN line names
+/// the attempt, elapsed time, auth mode and image reference (ADDENDUM 1),
+/// and the error names the attempt and the elapsed time. The child's
+/// pipes are drained by dedicated reader tasks, so the kill path captures
+/// its output too: EOF follows the group TERM.
+#[allow(clippy::too_many_arguments)]
 async fn attempt_genpolicy(
     binary: &Path,
     args: &[String],
@@ -521,6 +633,7 @@ async fn attempt_genpolicy(
     deadline: tokio::time::Instant,
     attempt_no: u8,
     auth_mode: &'static str,
+    image_ref: &str,
 ) -> Result<Output> {
     let started = tokio::time::Instant::now();
     tracing::info!(
@@ -542,35 +655,73 @@ async fn attempt_genpolicy(
             .env("REGISTRY_AUTH_FILE", auth_file)
             .env("DOCKER_CONFIG", docker_dir);
     }
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("executing genpolicy binary {}", binary.display()))?;
-    // Capture the pid BEFORE the wait: `wait_with_output` consumes the
-    // Child, so the group kill on expiry works from the pid alone. The
-    // guard TERMs the group on ANY cancellation (budget, CLI Ctrl-C drop,
-    // panic), not only the timeout path.
+    // Capture the pid BEFORE the wait: the group kill on expiry works from
+    // the pid alone. The guard TERMs the group on ANY cancellation
+    // (budget, CLI Ctrl-C drop, panic), not only the timeout path.
     let pid = child.id();
     let _guard = ProcessGroupGuard { pid };
+    // Reader tasks own the pipes for BOTH paths (ADDENDUM 2): the kill
+    // path would lose `wait_with_output`'s capture entirely, and EOF
+    // arrives here once the TERMed group closes the pipe.
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|pipe| tokio::spawn(drain_child_pipe(pipe)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| tokio::spawn(drain_child_pipe(pipe)));
+    let secrets = credential_secrets(env);
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    match tokio::time::timeout(remaining, child.wait_with_output()).await {
-        Ok(result) => {
-            let output = result
+    match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(status) => {
+            let status = status
                 .with_context(|| format!("waiting for genpolicy binary {}", binary.display()))?;
+            let stdout = collect_child_output(stdout_reader).await;
+            let stderr = collect_child_output(stderr_reader).await;
             tracing::info!(
                 attempt = attempt_no,
                 auth = auth_mode,
-                status = ?output.status,
+                image_ref = image_ref,
+                status = ?status,
                 duration_ms = started.elapsed().as_millis() as u64,
-                stdout_bytes = output.stdout.len(),
-                stderr_bytes = output.stderr.len(),
+                stdout_bytes = stdout.len(),
+                stderr_bytes = stderr.len(),
+                stdout_tail = %render_output_tail(&stdout, &secrets),
+                stderr_tail = %render_output_tail(&stderr, &secrets),
                 "genpolicy invocation finished"
             );
             _guard.disarm();
-            Ok(output)
+            Ok(Output {
+                status,
+                stdout,
+                stderr,
+            })
         }
         Err(_) => {
             kill_process_group_by_pid(pid, attempt_no).await;
             let elapsed = started.elapsed();
+            let stdout = collect_child_output(stdout_reader).await;
+            let stderr = collect_child_output(stderr_reader).await;
+            // ADDENDUM 1: dev runs with RUST_LOG unset render nothing from
+            // INFO lines, so the expiry/kill path must ALSO carry a WARN
+            // naming the attempt, the elapsed time, the auth mode and the
+            // image reference — with the same redacted tails (ADDENDUM 2).
+            tracing::warn!(
+                attempt = attempt_no,
+                auth = auth_mode,
+                image_ref = image_ref,
+                elapsed_ms = elapsed.as_millis() as u64,
+                elapsed = ?elapsed,
+                stdout_bytes = stdout.len(),
+                stderr_bytes = stderr.len(),
+                stdout_tail = %render_output_tail(&stdout, &secrets),
+                stderr_tail = %render_output_tail(&stderr, &secrets),
+                "genpolicy budget expired; child process group terminated"
+            );
             bail!(
                 "genpolicy timed out: attempt {attempt_no} (auth: {auth_mode}) exceeded the total budget; elapsed {elapsed:?}"
             );
@@ -587,6 +738,7 @@ async fn run_genpolicy(
     work_dir: &Path,
     total_budget: std::time::Duration,
     permits: Option<&tokio::sync::Semaphore>,
+    image_ref: &str,
 ) -> Result<Output> {
     // The concurrency cap (if configured) is held across BOTH attempts of
     // this step: one request, one generator slot (Devin T5).
@@ -600,7 +752,17 @@ async fn run_genpolicy(
         None => None,
     };
     let deadline = tokio::time::Instant::now() + total_budget;
-    let output = attempt_genpolicy(binary, args, work_dir, None, deadline, 1, "configured").await?;
+    let output = attempt_genpolicy(
+        binary,
+        args,
+        work_dir,
+        None,
+        deadline,
+        1,
+        "configured",
+        image_ref,
+    )
+    .await?;
     if output.status.success() {
         return Ok(output);
     }
@@ -617,6 +779,7 @@ async fn run_genpolicy(
         deadline,
         2,
         "anonymous-registry",
+        image_ref,
     )
     .await
 }
@@ -2445,6 +2608,7 @@ exit 101
                     work.path(),
                     std::time::Duration::from_secs(30),
                     None,
+                    "test://workload-image",
                 )
                 .await
             })
@@ -3911,6 +4075,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
                     work.path(),
                     std::time::Duration::from_millis(300),
                     None,
+                    "test://d1-workload-image",
                 )
                 .await
             })
@@ -3934,11 +4099,21 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     async fn healthz_style_work_answers_during_the_stalled_child_wait() {
         // (d2) DISCRIMINATING worker-parking proof: async work must make
         // progress WHILE the stalled child is still being waited on, not
-        // after the generation future resolves. Sabotage-proven: with the
-        // wait swapped back to a blocking std call, this test goes RED
-        // (elapsed assertion) while the generation stalls.
+        // after the generation future resolves. The clock is captured
+        // BEFORE `tokio::join!` (t0), so BOTH parking shapes are caught:
+        // (1) a blocking std wait restored inside the attempt (the
+        //     pre-fix shape; S2) — the runtime parks for the whole child
+        //     runtime, healthz answers only after it, elapsed >> 1s;
+        // (2) a bounded worker park right after spawn (std sleep 8 s
+        //     between spawn and the timeout await) — the single-threaded
+        //     test runtime cannot poll healthz until the park ends, so
+        //     elapsed >= 8s.
+        // Both sabotages were RUN at this head: each goes RED on the
+        // elapsed assert below (and shape (1) also trips the is_err
+        // assert — the budget never fires while parked).
         let work = tempfile::tempdir().unwrap();
         let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 10\n");
+        let t0 = std::time::Instant::now();
         let genpolicy = async {
             run_genpolicy(
                 &binary,
@@ -3946,24 +4121,26 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
                 work.path(),
                 std::time::Duration::from_secs(5),
                 None,
+                "test://d2-workload-image",
             )
             .await
         };
         let healthz = async {
-            let started = std::time::Instant::now();
             let mut ticks = 0;
             while ticks < 5 {
                 tokio::task::yield_now().await;
                 ticks += 1;
             }
-            (ticks, started.elapsed())
+            // Measured INSIDE the future from the pre-join t0: if the
+            // worker is parked, this timestamp still reflects the park.
+            (ticks, t0.elapsed())
         };
         let (result, (ticks, healthz_elapsed)) = tokio::join!(genpolicy, healthz);
         assert!(result.is_err(), "the stalled child hits the budget");
         assert_eq!(ticks, 5);
         assert!(
             healthz_elapsed < std::time::Duration::from_secs(1),
-            "async work progressed DURING the wait (elapsed {healthz_elapsed:?}), not after it"
+            "async work progressed DURING the wait (healthz answered {healthz_elapsed:?} after t0, captured before the join), not after the generation future resolved"
         );
     }
 
@@ -3995,6 +4172,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
                     work.path(),
                     std::time::Duration::from_millis(400),
                     None,
+                    "test://d1b-workload-image",
                 )
                 .await
             })
@@ -4017,13 +4195,170 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(gone, "the spawned helper was TERMed with the group");
+        // NOTE (QA F-4, reported as asked): this pins the OUTCOME — the
+        // helper is gone after expiry. It deliberately does not
+        // discriminate WHICH kill path TERMed it: the explicit
+        // budget-branch kill and the ProcessGroupGuard's Drop are
+        // belt-and-braces by design (the guard fires on EVERY
+        // cancellation path; the explicit kill fires first, before the
+        // expiry WARN is emitted), and no-op-ing either one alone keeps
+        // this test green — which is the intended redundancy, not a gap.
+    }
+
+    /// io::Write sink shared with the tracing subscriber so tests can
+    /// grep the exact log lines production emits.
+    #[derive(Clone)]
+    struct SharedLogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for SharedLogSink {
+        type Writer = SharedLogSink;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn logged_tails_carry_content_but_never_the_childs_credentials() {
+        // (ADDENDUM 1 + 2; QA F-1/F-2) — one test, both paths:
+        // SUCCESS: the child dumps its own auth file to stderr (the
+        //   worst-case leak attempt — REGISTRY_AUTH_FILE is exactly the
+        //   credential channel in production) and a benign marker to
+        //   stdout, then exits 0: the INFO finish line carries BOTH
+        //   redacted tails; the benign marker IS logged, the credential
+        //   marker is NOT.
+        // KILL: the same child then sleeps past the budget: the WARN
+        //   expiry line names attempt / auth mode / image reference /
+        //   elapsed (ADDENDUM 1) and carries the same redacted tails
+        //   (ADDENDUM 2, kill path — the reader tasks keep the bytes
+        //   past the group TERM); the credential marker appears in NO
+        //   captured log line.
+        let work = tempfile::tempdir().unwrap();
+        let secret_marker = "SECRETMARKER-DO-NOT-LOG==";
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        fs::write(
+            &auth_file,
+            format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{secret_marker}"}}}}}}"#),
+        )
+        .unwrap();
+        let leak = r#"cat "$REGISTRY_AUTH_FILE" 1>&2"#;
+        // Distinct files: write_fake_genpolicy always uses the same name,
+        // so the second write would silently replace the first.
+        let write_named = |name: &str, body: String| {
+            use std::os::unix::fs::PermissionsExt;
+            let path = work.path().join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let success_binary = write_named(
+            "leak-success-genpolicy",
+            format!("#!/bin/sh\n{leak}\necho BENIGN-TAIL-MARKER\n"),
+        );
+        let stalling_binary = write_named(
+            "leak-stall-genpolicy",
+            format!("#!/bin/sh\n{leak}\necho BENIGN-TAIL-MARKER\nsleep 30\n"),
+        );
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &success_binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    7,
+                    "configured",
+                    "test://redaction-image",
+                )
+                .await
+                .expect("success-path child exits 0");
+                assert!(success.status.success());
+                let error = attempt_genpolicy(
+                    &stalling_binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+                    9,
+                    "configured",
+                    "test://redaction-image",
+                )
+                .await
+                .expect_err("the stalling child hits the budget");
+                assert!(
+                    format!("{error:#}").contains("genpolicy timed out: attempt 9"),
+                    "error names the attempt: {error:#}"
+                );
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        // Tails carry real content on BOTH paths...
+        assert!(
+            captured.contains("BENIGN-TAIL-MARKER"),
+            "tails log child stdout/stderr content: {captured}"
+        );
+        assert!(
+            captured.contains("stdout_bytes=") && captured.contains("stderr_bytes="),
+            "byte counts still present: {captured}"
+        );
+        // ...ADDENDUM 1: the expiry WARN names all four facts...
+        let warn_line = captured
+            .lines()
+            .find(|line| line.contains("genpolicy budget expired"))
+            .expect("a WARN line for the expiry path");
+        for expected in [
+            "attempt=9",
+            "auth=\"configured\"",
+            "image_ref=\"test://redaction-image\"",
+        ] {
+            assert!(
+                warn_line.contains(expected),
+                "WARN line must name {expected}: {warn_line}"
+            );
+        }
+        assert!(
+            warn_line.contains("elapsed_ms="),
+            "WARN line names the elapsed time: {warn_line}"
+        );
+        // ...and the credential NEVER leaks into any captured log line.
+        assert!(
+            !captured.contains(secret_marker),
+            "the child's credential marker must not appear in any log line: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted]"),
+            "redaction replaced the credential bytes, not just dropped them: {captured}"
+        );
     }
 
     #[test]
     fn retry_does_not_reset_the_shared_budget() {
         // (d4 / Devin T4): the deadline spans BOTH attempts. Attempt 1
-        // fails immediately; attempt 2 stalls; the total elapsed must stay
-        // near the single budget (a per-attempt reset would double it).
+        // CONSUMES MOST OF THE BUDGET (sleeps 500 ms of the 600 ms, then
+        // fails with 101); attempt 2 stalls. With the shared deadline,
+        // attempt 2 is killed ~100 ms in and the total stays ~600 ms
+        // (GREEN). With the reset bug (attempt 2 handed a FRESH 600 ms
+        // deadline — the sabotage RUN at this head: attempt 2's call site
+        // passes now + total_budget), attempt 2 runs its own full budget
+        // and the total lands ~1.1 s, outside the 1.5x bound (RED).
         let work = tempfile::tempdir().unwrap();
         let binary = write_fake_genpolicy(
             work.path(),
@@ -4032,14 +4367,27 @@ case "$REGISTRY_AUTH_FILE" in
   */anonymous-registry/config.json)
     sleep 30
     ;;
+  *)
+    sleep 0.5
+    exit 101
+    ;;
 esac
-exit 101
 "#,
         );
         let budget = std::time::Duration::from_millis(600);
         let started = std::time::Instant::now();
         let error = current_thread_runtime()
-            .block_on(async { run_genpolicy(&binary, &[], work.path(), budget, None).await })
+            .block_on(async {
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    budget,
+                    None,
+                    "test://d4-workload-image",
+                )
+                .await
+            })
             .expect_err("the stalled retry must hit the SHARED budget");
         let rendered = format!("{error:#}");
         assert!(
@@ -4080,6 +4428,7 @@ exit 101
                     work.path(),
                     std::time::Duration::from_secs(30),
                     None,
+                    "test://workload-image",
                 )
                 .await
             })
@@ -4092,10 +4441,22 @@ exit 101
     async fn concurrency_cap_queues_a_third_genpolicy_step() {
         // (Devin T5): at most max_concurrent generator steps run at once;
         // the third waits for a permit instead of starting under the same
-        // container limits.
+        // container limits. PROVEN BY EVENT ORDER, not wall-clock
+        // thresholds: every child appends "start"/"end" markers (with its
+        // pid) to one O_APPEND file in the shared work dir, and the third
+        // starter's start marker must appear AFTER some other child's end
+        // marker — a permit frees only when a whole step completes, so a
+        // third child can only spawn after an earlier one ended. With the
+        // cap removed (sabotage RUN at this head: the semaphore acquire
+        // dropped) all three start markers precede the first end marker
+        // and the ordering assert goes RED. Immune to box load: no timing
+        // bounds on the children themselves.
         let work = tempfile::tempdir().unwrap();
-        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 1\n");
-        let budget = std::time::Duration::from_secs(10);
+        let binary = write_fake_genpolicy(
+            work.path(),
+            "#!/bin/sh\necho \"start $$\" >> markers.log\nsleep 1\necho \"end $$\" >> markers.log\n",
+        );
+        let budget = std::time::Duration::from_secs(30);
         let cap = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
         let mut handles = Vec::new();
         for _ in 0..3 {
@@ -4103,22 +4464,53 @@ exit 101
             let work_dir = work.path().to_path_buf();
             let permits = cap.clone();
             handles.push(tokio::spawn(async move {
-                let started = std::time::Instant::now();
-                let result = run_genpolicy(&binary, &[], &work_dir, budget, Some(&*permits)).await;
-                (result.is_ok(), started.elapsed())
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    &work_dir,
+                    budget,
+                    Some(&*permits),
+                    "test://t5-workload-image",
+                )
+                .await
+                .is_ok()
             }));
         }
-        let mut overlaps = 0;
         for handle in handles {
-            let (ok, elapsed) = handle.await.unwrap();
-            assert!(ok);
-            if elapsed >= std::time::Duration::from_secs(2) {
-                overlaps += 1;
+            assert!(handle.await.unwrap(), "every step succeeds");
+        }
+        let markers = fs::read_to_string(work.path().join("markers.log"))
+            .expect("children appended their markers");
+        let events: Vec<(&str, &str)> = markers
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                match (parts.next(), parts.next()) {
+                    (Some(kind), Some(_pid)) => Some((kind, line)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let starts = events.iter().filter(|(kind, _)| *kind == "start").count();
+        let ends = events.iter().filter(|(kind, _)| *kind == "end").count();
+        assert_eq!((starts, ends), (3, 3), "marker log: {markers}");
+        // The third START (by append order) must come after some END.
+        let mut starts_seen = 0;
+        let mut ends_before_third_start = 0;
+        for (kind, _) in &events {
+            if *kind == "start" {
+                starts_seen += 1;
+                if starts_seen == 3 {
+                    break;
+                }
+            } else if *kind == "end" {
+                ends_before_third_start += 1;
             }
         }
+        assert_eq!(starts_seen, 3, "marker log: {markers}");
         assert!(
-            overlaps >= 1,
-            "at least one step queued behind the cap (took >= 2s while two 1s children held the permits)"
+            ends_before_third_start >= 1,
+            "the third child started only after an earlier step released its permit; marker log: {markers}"
         );
     }
 }
