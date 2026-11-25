@@ -323,6 +323,10 @@ impl GenpolicyConfig {
             args.push(settings_dir.display().to_string());
         }
 
+        // The total budget is ONE deadline for the whole step: the first
+        // run, and — if the guest-pull normalizer engages — its single
+        // retry, share it.
+        let deadline = tokio::time::Instant::now() + self.total_budget;
         let output = run_genpolicy(
             &self.binary,
             &args,
@@ -332,6 +336,41 @@ impl GenpolicyConfig {
             &descriptor.image_ref,
         )
         .await?;
+        let output = if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let patches = parse_guest_pull_patches(&stderr);
+            if patches.is_empty() {
+                output
+            } else {
+                // genpolicy 4.3.1 exits 1 for a guest-pulled container whose
+                // image config declares a non-trivial UID/GID/gids when the
+                // pod spec carries no explicit securityContext for it, and
+                // its own remediation is to set those values. Patch them
+                // into the manifest (the values are the image's own
+                // declared set, parsed from genpolicy's message) and re-run
+                // genpolicy ONCE inside the same total budget.
+                tracing::info!(
+                    containers = patches.len(),
+                    "genpolicy guest-pull securityContext normalizer engaged; re-running once inside the same budget"
+                );
+                let patched_manifest =
+                    apply_guest_pull_patches(&invocation.manifest_yaml, &patches)?;
+                std::fs::write(&manifest_path, &patched_manifest)
+                    .with_context(|| format!("writing {}", manifest_path.display()))?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                run_genpolicy(
+                    &self.binary,
+                    &args,
+                    dir.path(),
+                    remaining,
+                    Some(semaphore),
+                    &descriptor.image_ref,
+                )
+                .await?
+            }
+        } else {
+            output
+        };
         if !output.status.success() {
             bail!(
                 "genpolicy failed with status {}: {}",
@@ -347,6 +386,169 @@ impl GenpolicyConfig {
             invocation,
         })
     }
+}
+
+/// One guest-pull securityContext patch parsed from genpolicy's own
+/// error message (the values are the IMAGE CONFIG's declared user/group —
+/// genpolicy derived them from the image, so pinning them into the pod
+/// manifest cannot drift from the image's intent).
+#[derive(Debug, Clone, PartialEq)]
+struct GuestPullSecurityContext {
+    container: String,
+    run_as_user: u64,
+    run_as_group: u64,
+    supplemental_groups: Vec<u64>,
+}
+
+/// Parse every guest-pull ERROR occurrence in genpolicy's stderr:
+/// `... guest_pull is enabled for container '<name>' using image '<ref>'.
+///  The generated policy expects UID=<n>, GID=<n>, AdditionalGids={<n>,...}; ...`
+/// Occurrences that do not fully parse are skipped (an empty result means
+/// the caller does not retry).
+fn parse_guest_pull_patches(stderr: &str) -> Vec<GuestPullSecurityContext> {
+    const CONTAINER_MARKER: &str = "guest_pull is enabled for container '";
+    const EXPECTS_MARKER: &str = "The generated policy expects ";
+    const GIDS_MARKER: &str = "AdditionalGids={";
+    let mut patches = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = stderr[cursor..].find(CONTAINER_MARKER) {
+        let marker_start = cursor + offset;
+        let name_start = marker_start + CONTAINER_MARKER.len();
+        let Some(name_len) = stderr[name_start..].find('\'') else {
+            break;
+        };
+        let container = stderr[name_start..name_start + name_len].to_string();
+        // Bound the expects-scan by the NEXT occurrence (or EOF).
+        let next_marker = stderr[name_start..]
+            .find(CONTAINER_MARKER)
+            .map(|index| name_start + index)
+            .unwrap_or(stderr.len());
+        let Some(expects) = stderr[name_start..next_marker].find(EXPECTS_MARKER) else {
+            cursor = name_start;
+            continue;
+        };
+        let segment = &stderr[name_start + expects + EXPECTS_MARKER.len()..next_marker];
+        let parse_number = |text: &str, key: &str| -> Option<u64> {
+            let start = text.find(key)? + key.len();
+            let end = text[start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            text[start..end].parse().ok()
+        };
+        let run_as_user = parse_number(segment, "UID=");
+        let run_as_group = parse_number(segment, "GID=");
+        let supplemental_groups = segment.find(GIDS_MARKER).and_then(|start| {
+            let open = start + GIDS_MARKER.len();
+            let close = segment[open..].find('}')? + open;
+            Some(
+                segment[open..close]
+                    .split(',')
+                    .filter_map(|value| value.trim().parse().ok())
+                    .collect::<Vec<u64>>(),
+            )
+        });
+        if let (Some(run_as_user), Some(run_as_group), Some(supplemental_groups)) =
+            (run_as_user, run_as_group, supplemental_groups)
+        {
+            patches.push(GuestPullSecurityContext {
+                container,
+                run_as_user,
+                run_as_group,
+                supplemental_groups,
+            });
+        }
+        cursor = next_marker;
+    }
+    patches
+}
+
+/// Inject the parsed securityContext into each named container of the pod
+/// manifest (containers and initContainers), preserving every other
+/// securityContext key the manifest already carries. The patched manifest
+/// is re-serialized and re-run through genpolicy exactly once, inside the
+/// same total budget (the values come from genpolicy's own message, so
+/// they are by construction the image config's declared set).
+fn apply_guest_pull_patches(
+    manifest_yaml: &str,
+    patches: &[GuestPullSecurityContext],
+) -> Result<String> {
+    let mut manifest: serde_yaml::Value = serde_yaml::from_str(manifest_yaml)
+        .context("parsing the pod manifest for the guest-pull normalizer")?;
+    // Owned names: a borrowed &str would tie the manifest borrow across
+    // loop iterations.
+    let mut applied_names: Vec<String> = Vec::new();
+    for list_key in ["containers", "initContainers"] {
+        let Some(list) = manifest
+            .get_mut("spec")
+            .and_then(|spec| spec.get_mut(list_key))
+        else {
+            continue;
+        };
+        let serde_yaml::Value::Sequence(containers) = list else {
+            continue;
+        };
+        for container in containers.iter_mut() {
+            // Owned copy: the name is used after the container is
+            // mutably borrowed below.
+            let Some(name) = container
+                .get("name")
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(patch) = patches.iter().find(|patch| patch.container == name) else {
+                continue;
+            };
+            let mut security = match container.get("securityContext") {
+                Some(value @ serde_yaml::Value::Mapping(_)) => value.clone(),
+                Some(_) => {
+                    bail!("container {name} has a non-mapping securityContext in the pod manifest")
+                }
+                None => serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+            };
+            let security_map = match &mut security {
+                serde_yaml::Value::Mapping(map) => map,
+                _ => unreachable!("constructed as a mapping above"),
+            };
+            security_map.insert(
+                "runAsUser".into(),
+                serde_yaml::Value::Number(patch.run_as_user.into()),
+            );
+            security_map.insert(
+                "runAsGroup".into(),
+                serde_yaml::Value::Number(patch.run_as_group.into()),
+            );
+            security_map.insert(
+                "supplementalGroups".into(),
+                serde_yaml::Value::Sequence(
+                    patch
+                        .supplemental_groups
+                        .iter()
+                        .map(|gid| serde_yaml::Value::Number((*gid).into()))
+                        .collect(),
+                ),
+            );
+            let container_map = match container {
+                serde_yaml::Value::Mapping(map) => map,
+                _ => bail!("container {name} is not a mapping in the pod manifest"),
+            };
+            container_map.insert("securityContext".into(), security);
+            applied_names.push(name);
+        }
+    }
+    let missing: Vec<&str> = patches
+        .iter()
+        .map(|patch| patch.container.as_str())
+        .filter(|name| !applied_names.iter().any(|applied| applied == name))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "guest-pull normalizer: container(s) named in the error were not found in the pod manifest: {missing:?}"
+        );
+    }
+    serde_yaml::to_string(&manifest).context("serializing the normalized pod manifest")
 }
 
 fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String> {
@@ -4512,5 +4714,276 @@ exit 101
             ends_before_third_start >= 1,
             "the third child started only after an earlier step released its permit; marker log: {markers}"
         );
+    }
+
+    /// Shell body for the guest-pull normalizer fakes: records every
+    /// invocation (count + manifest snapshot) under the witness dir, then
+    /// succeeds when `until` matches the manifest, or prints `errors` and
+    /// exits 1.
+    fn normalizer_fake_body(witness: &str, until: &str, errors: &str) -> String {
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "manifest=\n",
+                "prev=\n",
+                "for a in \"$@\"; do\n",
+                "  if [ \"$prev\" = \"-y\" ]; then manifest=\"$a\"; fi\n",
+                "  prev=\"$a\"\n",
+                "done\n",
+                "n=$(cat {witness}/count 2>/dev/null || echo 0); n=$((n+1)); echo $n > {witness}/count\n",
+                "cp \"$manifest\" {witness}/seen-$n.yaml\n",
+                "if {until}; then\n",
+                // The success output cats a full synthetic policy (the
+                // guest-memory normalization requires the real shape).
+                "  echo \"NORMALIZER-POLICY-OK\"\n",
+                "  cat {witness}/success-policy.txt\n",
+                "  exit 0\n",
+                "fi\n",
+                "{errors}\n",
+                "exit 1\n"
+            ),
+            witness = witness,
+            until = until,
+            errors = errors
+        )
+    }
+
+    fn normalizer_config(binary: PathBuf, budget: std::time::Duration) -> GenpolicyConfig {
+        GenpolicyConfig {
+            binary,
+            version_pin: "kata-containers/genpolicy@4.3.1".to_string(),
+            rules_path: PathBuf::from("/nonexistent/rules.rego"),
+            settings_dir: None,
+            total_budget: budget,
+            max_concurrent: 2,
+        }
+    }
+
+    fn read_witness_u64(work: &Path, name: &str) -> u64 {
+        fs::read_to_string(work.join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn manifest_container<'a>(
+        manifest: &'a serde_yaml::Value,
+        name: &str,
+    ) -> Option<&'a serde_yaml::Value> {
+        manifest
+            .get("spec")?
+            .get("containers")?
+            .as_sequence()?
+            .iter()
+            .find(|container| container.get("name").and_then(|n| n.as_str()) == Some(name))
+    }
+
+    #[test]
+    fn guest_pull_normalizer_retries_once_with_the_parsed_security_context() {
+        // (T1) genpolicy exits 1 with the guest-pull ERROR: the normalizer
+        // parses UID/GID/AdditionalGids, injects runAsUser / runAsGroup /
+        // supplementalGroups into THAT container's securityContext, and
+        // re-runs genpolicy ONCE. The retry's pod.yaml (witness seen-3)
+        // carries exactly the parsed set on 'web' and leaves the other
+        // containers untouched; the final artifact is the successful
+        // run's output. Parsed values are unique (4242/4243) so the
+        // fixture's incidental user values cannot satisfy the fake.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let web_error = "printf '%s' \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=4242, GID=4243, AdditionalGids={5, 4242}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2";
+        let body = normalizer_fake_body(
+            &witness,
+            "grep -q 'runAsUser: 4242' \"$manifest\"",
+            web_error,
+        );
+        fs::write(
+            work.path().join("success-policy.txt"),
+            synthetic_memory_policy(),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let policy = current_thread_runtime()
+            .block_on(async { config.run(&fixed_descriptor()).await })
+            .expect("the normalized retry succeeds");
+        assert!(
+            policy.policy_text.contains("NORMALIZER-POLICY-OK"),
+            "the artifact is the successful run's output: {}",
+            policy.policy_text
+        );
+        assert_eq!(read_witness_u64(work.path(), "count"), 3);
+        let retry_manifest: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-3.yaml")).unwrap())
+                .unwrap();
+        let security = manifest_container(&retry_manifest, "web")
+            .and_then(|container| container.get("securityContext"))
+            .expect("web securityContext");
+        assert_eq!(
+            security.get("runAsUser").and_then(|v| v.as_u64()),
+            Some(4242)
+        );
+        assert_eq!(
+            security.get("runAsGroup").and_then(|v| v.as_u64()),
+            Some(4243)
+        );
+        assert_eq!(
+            security
+                .get("supplementalGroups")
+                .and_then(|v| v.as_sequence())
+                .map(|gids| gids.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>()),
+            Some(vec![5, 4242])
+        );
+        assert!(
+            security.get("readOnlyRootFilesystem").is_some(),
+            "pre-existing securityContext keys preserved: {security:?}"
+        );
+        let attestation = manifest_container(&retry_manifest, "attestation-proxy")
+            .and_then(|container| container.get("securityContext"));
+        assert_ne!(
+            attestation
+                .and_then(|s| s.get("runAsUser"))
+                .and_then(|v| v.as_u64()),
+            Some(4242),
+            "the patch did not leak into the sidecar"
+        );
+        assert!(attestation
+            .and_then(|s| s.get("supplementalGroups"))
+            .is_none());
+        let first_manifest: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-1.yaml")).unwrap())
+                .unwrap();
+        assert_ne!(
+            manifest_container(&first_manifest, "web")
+                .and_then(|c| c.get("securityContext"))
+                .and_then(|s| s.get("runAsUser"))
+                .and_then(|v| v.as_u64()),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn non_guest_pull_failures_do_not_engage_the_normalizer() {
+        // (T2) A non-guest-pull exit-1 never triggers the retry: only the
+        // two auth attempts run, and the caller sees the original error.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(
+            &witness,
+            "false",
+            "echo \"ERROR: rules violation: unrelated failure\" >&2",
+        );
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let error = current_thread_runtime()
+            .block_on(async { config.run(&fixed_descriptor()).await })
+            .expect_err("the unrelated failure surfaces");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("rules violation: unrelated failure"),
+            "the original error surfaces: {rendered}"
+        );
+        assert_eq!(
+            read_witness_u64(work.path(), "count"),
+            2,
+            "configured + anonymous attempts only — no normalizer retry"
+        );
+    }
+
+    #[test]
+    fn normalizer_retry_shares_the_total_budget() {
+        // (T3) The normalizer retry runs inside the SAME deadline: a slow
+        // first run leaves only the remainder, and a stalling retry is
+        // killed by the shared budget (not a fresh one).
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "false", "if [ -n \"$REGISTRY_AUTH_FILE\" ]; then printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2; exit 1; fi; sleep 0.8; printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2; exit 1");
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_millis(1200));
+        let started = std::time::Instant::now();
+        let error = current_thread_runtime()
+            .block_on(async { config.run(&fixed_descriptor()).await })
+            .expect_err("the stalling retry is killed by the shared budget");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("genpolicy timed out: attempt 1"),
+            "the retry run's attempt hits the shared deadline: {rendered}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "total elapsed {elapsed:?} stays inside ~1.5x the 1200ms budget — the deadline is shared"
+        );
+        assert_eq!(
+            read_witness_u64(work.path(), "count"),
+            3,
+            "slow fail, fast anonymous fail, killed retry"
+        );
+    }
+
+    #[test]
+    fn normalizer_patches_each_guest_pulled_container() {
+        // (T4) Two guest-pull ERROR occurrences (web + attestation-proxy)
+        // in one stderr: each container gets its own parsed set.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let side_error = "printf '%s' \"ERROR: guest_pull is enabled for container 'attestation-proxy' using image 'ghcr.io/enclava-labs/attestation-proxy@sha256:1111'. The generated policy expects UID=20002, GID=20002, AdditionalGids={0, 20002}; containerd may not reproduce image-derived user/group values.\" >&2\necho >&2";
+        let web_error = "printf '%s' \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=4242, GID=4243, AdditionalGids={5, 4242}; containerd may not reproduce image-derived user/group values. Set explicit Kubernetes securityContext values.\" >&2\necho >&2";
+        let body = normalizer_fake_body(
+            &witness,
+            "grep -q 'runAsUser: 4242' \"$manifest\" && grep -q 'runAsUser: 20002' \"$manifest\"",
+            &format!("{side_error}\n{web_error}"),
+        );
+        fs::write(
+            work.path().join("success-policy.txt"),
+            synthetic_memory_policy(),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        current_thread_runtime()
+            .block_on(async { config.run(&fixed_descriptor()).await })
+            .expect("both containers normalized in one retry");
+        let retry_manifest: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-3.yaml")).unwrap())
+                .unwrap();
+        let security = |name: &str| {
+            manifest_container(&retry_manifest, name).and_then(|c| c.get("securityContext"))
+        };
+        let web = security("web").expect("web securityContext");
+        assert_eq!(web.get("runAsUser").and_then(|v| v.as_u64()), Some(4242));
+        assert_eq!(
+            web.get("supplementalGroups")
+                .and_then(|v| v.as_sequence())
+                .map(|gids| gids.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>()),
+            Some(vec![5, 4242])
+        );
+        let attestation = security("attestation-proxy").expect("sidecar securityContext");
+        assert_eq!(
+            attestation.get("runAsUser").and_then(|v| v.as_u64()),
+            Some(20002)
+        );
+        assert_eq!(
+            attestation
+                .get("supplementalGroups")
+                .and_then(|v| v.as_sequence())
+                .map(|gids| gids.iter().filter_map(|v| v.as_u64()).collect::<Vec<u64>>()),
+            Some(vec![0, 20002])
+        );
+        let init = security("enclava-init").expect("init securityContext");
+        assert!(init.get("supplementalGroups").is_none());
+        assert_ne!(init.get("runAsUser").and_then(|v| v.as_u64()), Some(4242));
+    }
+
+    #[test]
+    fn guest_pull_error_parser_extracts_the_expected_set() {
+        // QA's verbatim production message shape (values as emitted by
+        // genpolicy 4.3.1 against the C5 fixture image).
+        let stderr = "ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\n";
+        let patches = parse_guest_pull_patches(stderr);
+        assert_eq!(patches.len(), 1, "parsed {patches:?}");
+        assert_eq!(patches[0].container, "web");
+        assert_eq!(patches[0].run_as_user, 10001);
+        assert_eq!(patches[0].supplemental_groups, vec![0, 6, 27, 10001]);
     }
 }
