@@ -484,6 +484,15 @@ fn term_process_group_by_pid(pid: u32) -> bool {
 /// (ADDENDUM 2: a fixed small bound).
 const OUTPUT_TAIL_MAX_BYTES: usize = 512;
 
+/// Bound on the captured bytes feeding ONE tail render (R2 item 2): a
+/// child can emit tens/hundreds of MB inside its step budget, and the
+/// redaction passes are linear in that input for every needle. The log
+/// path takes the LAST `LOG_TAIL_INPUT_MAX_BYTES` bytes plus a
+/// longest-needle lookback (a secret straddling the window start is
+/// still matched whole); the full captured stream still reaches the
+/// Output consumer unchanged.
+const LOG_TAIL_INPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Credential byte strings that must never appear in a log tail: the
 /// registry auth config handed to the child (the file we wrote for the
 /// anonymous attempt, or the service's own REGISTRY_AUTH_FILE for the
@@ -524,20 +533,32 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
     let Ok(parsed) = serde_json::from_slice::<Value>(document) else {
         return values;
     };
-    fn walk(node: &Value, values: &mut Vec<Vec<u8>>) {
-        match node {
-            Value::String(s) => {
-                let bytes = s.as_bytes();
-                if !bytes.is_empty() {
-                    values.push(bytes.to_vec());
+    // (R2 item 3a) Only credential-bearing fields become value needles:
+    // the docker-config walk used to take EVERY string value, so registry
+    // hostnames (ghcr.io), usernames-as-registry-keys and any other
+    // non-secret context was scrubbed from tails, and raw values under
+    // four bytes over-matched ordinary text. The document itself stays a
+    // whole-buffer needle via the caller's `secrets`, so a verbatim echo
+    // of the file is still redacted.
+    const CREDENTIAL_FIELDS: [&str; 6] = [
+        "auth",
+        "identitytoken",
+        "registrytoken",
+        "username",
+        "password",
+        "email",
+    ];
+    if let Some(auths) = parsed.get("auths").and_then(Value::as_object) {
+        for entry in auths.values() {
+            for field in CREDENTIAL_FIELDS {
+                if let Some(Value::String(value)) = entry.get(field) {
+                    if !value.is_empty() {
+                        values.push(value.as_bytes().to_vec());
+                    }
                 }
             }
-            Value::Array(items) => items.iter().for_each(|item| walk(item, values)),
-            Value::Object(map) => map.values().for_each(|item| walk(item, values)),
-            _ => {}
         }
     }
-    walk(&parsed, &mut values);
     // Base64 `auth` tokens decode to `user:password`; redact the decoded
     // pair and the password half in addition to the token itself.
     if let Some(auths) = parsed.get("auths").and_then(Value::as_object) {
@@ -563,6 +584,95 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
     // The >=4 floor lives only in secret_variants' ENCODING expansion,
     // where it prevents redacting every 2-char hex pair in normal text.
     values
+}
+
+/// Separated-encoding redaction (R2 item 1, critical): GNU `base64`
+/// wraps its output at 76 columns BY DEFAULT and `od -An -tx1` emits
+/// space-separated hex, so the default output of the very tools this
+/// redaction cites defeats contiguous matching — the credential's
+/// encoded form appears with `\n`/space bytes interleaved, and stripping
+/// them recovers it. Canonicalize a copy of the buffer by dropping
+/// `b' '`, `b'\n'`, `b'\r'`, `b'\t'` while keeping the original index of
+/// every surviving byte, match the needle set on the canonicalized copy
+/// (longest first, never consuming an already-consumed span), and blank
+/// each matched span back through the index map — separators INSIDE the
+/// span are removed with it. Runs IN ADDITION to the contiguous pass.
+fn redact_separated_encodings(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
+    let mut canonical = Vec::with_capacity(haystack.len());
+    let mut original_index = Vec::with_capacity(haystack.len());
+    for (i, &b) in haystack.iter().enumerate() {
+        if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
+            continue;
+        }
+        canonical.push(b);
+        original_index.push(i);
+    }
+    let mut consumed = vec![false; canonical.len()];
+    for needle in needles {
+        let needle = needle.as_slice();
+        if needle.len() < 2 || needle.len() > canonical.len() {
+            // A one-byte needle would blank single bytes across ordinary
+            // separated text; the encoding needles are all >= 4 anyway,
+            // and raw one-byte credentials cannot survive separator
+            // stripping (their byte IS the match — blanking one byte).
+            continue;
+        }
+        let mut i = 0;
+        while i + needle.len() <= canonical.len() {
+            let end = i + needle.len();
+            if !consumed[i..end].contains(&true) && canonical[i..end] == needle[..] {
+                for slot in &mut consumed[i..end] {
+                    *slot = true;
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // Map each consumed canonical run back to its ORIGINAL span: the run
+    // [start..=end] covers every original byte from
+    // original_index[start] through original_index[end], including the
+    // separators inside it.
+    let mut blanked = vec![false; haystack.len()];
+    let mut run_start: Option<usize> = None;
+    for (pos, is_consumed) in consumed.iter().enumerate() {
+        if *is_consumed {
+            run_start.get_or_insert(pos);
+        } else if let Some(start) = run_start.take() {
+            for original in blanked
+                .iter_mut()
+                .take(original_index[pos - 1] + 1)
+                .skip(original_index[start])
+            {
+                *original = true;
+            }
+        }
+    }
+    if let Some(start) = run_start {
+        let last = original_index[canonical.len() - 1];
+        for original in blanked
+            .iter_mut()
+            .take(last + 1)
+            .skip(original_index[start])
+        {
+            *original = true;
+        }
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if blanked[i] {
+            out.extend_from_slice(b"[redacted]");
+            while i < haystack.len() && blanked[i] {
+                i += 1;
+            }
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Common encodings of one secret byte string: raw, hex (lower and upper),
@@ -686,10 +796,32 @@ fn render_output_tail(bytes: &[u8], secrets: &[Vec<u8>]) -> String {
     for needle in &needles {
         redacted = replace_bytes(redacted, needle, b"[redacted]");
     }
+    // The separated pass catches the interleaved forms the contiguous
+    // needles cannot see (R2 item 1): 76-column-wrapped base64,
+    // space-separated hex, single-space-joined encodings.
+    redacted = redact_separated_encodings(&redacted, &needles);
     let start = redacted.len().saturating_sub(OUTPUT_TAIL_MAX_BYTES);
     String::from_utf8_lossy(&redacted[start..])
         .replace('\r', "\\r")
         .replace('\n', "\\n")
+}
+
+/// Render one child stream's redacted tail for a LOG line, OFF the async
+/// worker (R2 item 2): the whole-window × whole-needle-set passes (now
+/// including the separated-encoding canonical pass) run on tokio's
+/// blocking pool against the bounded input window. The genpolicy
+/// concurrency permit is still held across the render — the slot-release
+/// delay is bounded by the capped window (see the PR discussion).
+async fn redacted_tail_for_log(bytes: Vec<u8>, secrets: Vec<Vec<u8>>) -> String {
+    let needles = redaction_needles(&secrets);
+    let lookback = needles.iter().map(Vec::len).max().unwrap_or(0);
+    let window_start = bytes
+        .len()
+        .saturating_sub(LOG_TAIL_INPUT_MAX_BYTES + lookback);
+    let window = bytes[window_start..].to_vec();
+    tokio::task::spawn_blocking(move || render_output_tail(&window, &secrets))
+        .await
+        .unwrap_or_else(|_| "[redacted render unavailable]".to_string())
 }
 
 /// Drain a piped child stream in its own task so the kill path still gets
@@ -824,6 +956,8 @@ async fn attempt_genpolicy(
                 .with_context(|| format!("waiting for genpolicy binary {}", binary.display()))?;
             let stdout = collect_child_output(stdout_reader).await;
             let stderr = collect_child_output(stderr_reader).await;
+            let stdout_tail = redacted_tail_for_log(stdout.clone(), secrets.clone()).await;
+            let stderr_tail = redacted_tail_for_log(stderr.clone(), secrets.clone()).await;
             tracing::info!(
                 attempt = attempt_no,
                 auth = auth_mode,
@@ -832,8 +966,8 @@ async fn attempt_genpolicy(
                 duration_ms = started.elapsed().as_millis() as u64,
                 stdout_bytes = stdout.len(),
                 stderr_bytes = stderr.len(),
-                stdout_tail = %render_output_tail(&stdout, &secrets),
-                stderr_tail = %render_output_tail(&stderr, &secrets),
+                stdout_tail = %stdout_tail,
+                stderr_tail = %stderr_tail,
                 "genpolicy invocation finished"
             );
             _guard.disarm();
@@ -848,6 +982,8 @@ async fn attempt_genpolicy(
             let elapsed = started.elapsed();
             let stdout = collect_child_output(stdout_reader).await;
             let stderr = collect_child_output(stderr_reader).await;
+            let stdout_tail = redacted_tail_for_log(stdout.clone(), secrets.clone()).await;
+            let stderr_tail = redacted_tail_for_log(stderr.clone(), secrets.clone()).await;
             // ADDENDUM 1: dev runs with RUST_LOG unset render nothing from
             // INFO lines, so the expiry/kill path must ALSO carry a WARN
             // naming the attempt, the elapsed time, the auth mode and the
@@ -860,8 +996,8 @@ async fn attempt_genpolicy(
                 elapsed = ?elapsed,
                 stdout_bytes = stdout.len(),
                 stderr_bytes = stderr.len(),
-                stdout_tail = %render_output_tail(&stdout, &secrets),
-                stderr_tail = %render_output_tail(&stderr, &secrets),
+                stdout_tail = %stdout_tail,
+                stderr_tail = %stderr_tail,
                 "genpolicy budget expired; child process group terminated"
             );
             bail!(
@@ -5058,6 +5194,134 @@ exit 101
         assert!(
             tail_field.contains("SHORTOK"),
             "benign content still logged: {tail_line}"
+        );
+    }
+
+    #[test]
+    fn wrapped_base64_default_wrap_is_redacted() {
+        // (R2 item 1, critical): `base64 "$REGISTRY_AUTH_FILE"` with NO
+        // flags wraps at 76 columns — the DEFAULT output of the very tool
+        // the threat model cites. A wrapped line carries at most 76
+        // credential bytes contiguously, so every contiguous needle
+        // misses, and stripping the newlines recovers the full token.
+        // The separated pass canonicalizes the buffer and blanks the
+        // wrapped form whole. RED at the pre-R2 head: the first wrapped
+        // line leaked verbatim.
+        let work = tempfile::tempdir().unwrap();
+        use base64::Engine;
+        let marker = "SECRETMARKER-DO-NOT-LOG-WRAP-0123456789-ABCDEFGHIJ-0123456789";
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("qa-user:{marker}"));
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        let document = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#);
+        fs::write(&auth_file, &document).unwrap();
+        let binary =
+            write_fake_genpolicy(work.path(), "#!/bin/sh\nbase64 \"$REGISTRY_AUTH_FILE\"\n");
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    1,
+                    "configured",
+                    "test://r2-wrapped-base64",
+                )
+                .await
+                .unwrap();
+                assert!(success.status.success());
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        let whole_file_b64 = base64::engine::general_purpose::STANDARD.encode(&document);
+        let first_wrapped_line = &whole_file_b64[..76];
+        assert!(
+            !captured.contains(first_wrapped_line),
+            "the default-wrapped base64 line leaked (76-char contiguous run of the credential's base64, marker line {first_wrapped_line}): {captured}"
+        );
+        // The recovery vector itself must be closed: stripping ALL
+        // whitespace from the tail must not reassemble the token.
+        let stripped: String = captured.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !stripped.contains(&whole_file_b64),
+            "the wrapped credential is recoverable by stripping newlines: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted]"),
+            "the wrapped form was redacted: {captured}"
+        );
+    }
+
+    #[test]
+    fn spaced_hex_od_default_is_redacted() {
+        // (R2 item 1, critical): `od -An -tx1 "$REGISTRY_AUTH_FILE"` with
+        // NO tr emits space-separated hex — the whole auth document
+        // (registry, username, password) survives byte-for-byte with
+        // single spaces interleaved. RED at the pre-R2 head: the spaced
+        // hex of the document's bytes leaked verbatim.
+        let work = tempfile::tempdir().unwrap();
+        use base64::Engine;
+        let marker = "SECRETMARKER-DO-NOT-LOG-HEX-0123456789-ABCDEFGHIJ-0123456789";
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("qa-user:{marker}"));
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        let document = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#);
+        fs::write(&auth_file, &document).unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            "#!/bin/sh\nod -An -tx1 \"$REGISTRY_AUTH_FILE\"\n",
+        );
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    1,
+                    "configured",
+                    "test://r2-spaced-hex",
+                )
+                .await
+                .unwrap();
+                assert!(success.status.success());
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        let marker_hex = hex::encode(marker.as_bytes());
+        // The recovery vector must be closed: stripping ALL whitespace
+        // from the tail must not reassemble the credential's hex form
+        // (od interleaves single spaces; the pre-R2 head leaked it).
+        let stripped: String = captured.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !stripped.contains(&marker_hex),
+            "the spaced-hex credential is recoverable by stripping spaces (marker hex {marker_hex}): {captured}"
+        );
+        let document_hex = hex::encode(document.as_bytes());
+        assert!(
+            !stripped.contains(&document_hex),
+            "the whole auth document's spaced hex survived: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted]"),
+            "the spaced hex was redacted: {captured}"
         );
     }
 
