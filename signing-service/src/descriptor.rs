@@ -128,6 +128,14 @@ pub struct DeploymentDescriptor {
     pub tee_domain: String,
     #[serde(default)]
     pub custom_domains: Vec<String>,
+    /// Pod-level supplemental groups the deployment DECLARES (contract v1
+    /// of the guest-pull group discovery, policy-templates#23). Absent =
+    /// legacy descriptor: the manifest renders the platform baseline
+    /// [0, 6] and nothing changes. Canonical form (CAP side): sorted
+    /// unique. Optional + skipped when absent so legacy descriptor bytes
+    /// and their hashes are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 
     pub namespace: String,
     pub service_account: String,
@@ -549,6 +557,7 @@ pub mod tests {
             app_domain: "demo.abcd1234.enclava.dev".to_string(),
             tee_domain: "demo.abcd1234.tee.enclava.dev".to_string(),
             custom_domains: vec!["app.example.com".to_string()],
+            pod_supplemental_groups: None,
             namespace: "cap-abcd1234-demo".to_string(),
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [9; 32],

@@ -448,6 +448,7 @@ mod tests {
         GeneratedAgentPolicy {
             policy_text: "package agent_policy\n\ndefault CreateContainerRequest := true\n"
                 .to_string(),
+            pod_supplemental_groups: None,
             invocation: GenpolicyInvocation {
                 binary: PathBuf::from("genpolicy"),
                 args: vec!["-y".to_string(), "pod.yaml".to_string()],
