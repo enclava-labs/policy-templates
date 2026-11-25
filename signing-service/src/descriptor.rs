@@ -201,6 +201,40 @@ mod hex_measurement {
     }
 }
 
+/// Admission validation for the declared pod supplemental groups, mirroring
+/// enclava-common's `validate_pod_supplemental_groups` (contract v1,
+/// policy-templates#23) so the service never signs or generates a policy
+/// for a list CAP would refuse. Some(list) must carry 1..=32 entries in
+/// 0..=2147483646 and MUST contain the platform baseline members 0 and 6;
+/// the reserved gids (10001 workload owner, 10002 ssh-relay, 65535
+/// nobody-legacy) are rejected by name — a declared list grants every
+/// container in the pod that identity. None (legacy) is always valid.
+pub fn validate_pod_supplemental_groups(groups: Option<&Vec<i64>>) -> Result<(), String> {
+    let Some(groups) = groups else {
+        return Ok(());
+    };
+    if groups.is_empty() || groups.len() > 32 {
+        return Err("pod_supplemental_groups must carry 1 to 32 entries".to_string());
+    }
+    if groups.iter().any(|g| !(0..=2147483646).contains(g)) {
+        return Err("pod_supplemental_groups entries must be in 0..=2147483646".to_string());
+    }
+    if !groups.contains(&0) || !groups.contains(&6) {
+        return Err(
+            "pod_supplemental_groups must contain the platform baseline 0 and 6".to_string(),
+        );
+    }
+    for reserved in [10001, 10002, 65535] {
+        if groups.contains(&reserved) {
+            return Err(format!(
+                "pod_supplemental_groups must not contain the reserved gid {reserved} \
+                 (10001 workload owner, 10002 ssh-relay, 65535 nobody-legacy)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_descriptor<'a>(
     envelope: &'a DeploymentDescriptorEnvelope,
     expected_pubkey: &VerifyingKey,
@@ -716,16 +750,53 @@ pub mod tests {
         );
     }
 
-    /// Pinned vector: the fixture's core hash with the declared groups
-    /// [0, 6, 27]. If either side's rendering changes, this fails.
+    /// Pinned vectors: the fixture's core AND full canonical hashes with the
+    /// declared groups [0, 6, 27], plus the unsorted/duplicate input's core
+    /// hash — so dedup-semantics or record-position drift fails
+    /// byte-exactly on this side, in both forms CAP signs.
     #[test]
-    fn declared_groups_descriptor_core_hash_is_pinned() {
+    fn declared_groups_hashes_are_pinned() {
         let mut descriptor = fixed_descriptor();
         descriptor.pod_supplemental_groups = Some(vec![0, 6, 27]);
         assert_eq!(
             hex::encode(descriptor_core_hash(&descriptor)),
             "e7db33071fb4a0c166cfcad973061072da9e7eaf3d1e2e50796dd7363c7aab80"
         );
+        assert_eq!(
+            hex::encode(Sha256::digest(descriptor_canonical_bytes(&descriptor))),
+            "36a7c4dd6a4094ddf264a3b7683416b4c50e51590f6e3166cb37dbbfd765171d"
+        );
+        let mut unsorted = fixed_descriptor();
+        unsorted.pod_supplemental_groups = Some(vec![27, 6, 0, 27]);
+        assert_eq!(
+            hex::encode(descriptor_core_hash(&unsorted)),
+            "e7db33071fb4a0c166cfcad973061072da9e7eaf3d1e2e50796dd7363c7aab80",
+            "unsorted/duplicated input canonicalizes to the pinned bytes"
+        );
+    }
+
+    /// The admission bounds mirror enclava-common's: 1..=32 entries,
+    /// 0..=2147483646, the baseline members 0 and 6, and the reserved
+    /// gids rejected by name. None (legacy) is always valid.
+    #[test]
+    fn declared_groups_admission_validation() {
+        assert!(validate_pod_supplemental_groups(None).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![0, 6])).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![6, 0, 27])).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![0, 27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&vec![6, 27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&vec![27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&Vec::new())).is_err());
+        let mut many = vec![0, 6];
+        many.extend(std::iter::repeat_n(27, 31));
+        assert_eq!(many.len(), 33);
+        assert!(validate_pod_supplemental_groups(Some(&many)).is_err());
+        for reserved in [10001, 10002, 65535] {
+            assert!(
+                validate_pod_supplemental_groups(Some(&vec![0, 6, reserved])).is_err(),
+                "reserved gid {reserved} must be rejected"
+            );
+        }
     }
 
     #[test]
