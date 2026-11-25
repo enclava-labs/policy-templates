@@ -224,6 +224,18 @@ async fn generate_agent_policy(
     if req.descriptor.schema_version != "v1" {
         return Err(AppError(anyhow!("unsupported descriptor schema_version")));
     }
+    // Defense in depth: the admission bounds mirror enclava-common's so the
+    // generation path never renders a policy for a reserved or unbounded
+    // declared list (2026-11-25 review on the canonical-record fix).
+    if let Err(reason) =
+        enclava_policy_signing_service::descriptor::validate_pod_supplemental_groups(
+            req.descriptor.pod_supplemental_groups.as_ref(),
+        )
+    {
+        return Err(AppError(anyhow!(
+            "pod_supplemental_groups rejected: {reason}"
+        )));
+    }
     // Guest-pull group discovery is capability-gated (contract v1); a
     // legacy request (no capability) keeps today's generation path, with
     // the typed guest-pull error when genpolicy demands declared groups.
