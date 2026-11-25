@@ -558,7 +558,10 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
             }
         }
     }
-    values.retain(|value| value.len() >= 4);
+    // No length floor here (Devin): a 3-byte password is still a
+    // credential — every string value of the auth document is redacted.
+    // The >=4 floor lives only in secret_variants' ENCODING expansion,
+    // where it prevents redacting every 2-char hex pair in normal text.
     values
 }
 
@@ -570,30 +573,53 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
 /// threat is a buggy/quoting child using one standard encoding.
 fn secret_variants(secret: &[u8]) -> Vec<Vec<u8>> {
     use base64::Engine;
+    // The raw form is ALWAYS a needle, however short (Devin: short
+    // credentials are still credentials); encodings are expanded only
+    // for sources of >= 4 bytes so normal short words are not scrubbed
+    // from tails by their 2-char hex forms.
     let mut variants = vec![secret.to_vec()];
-    variants.push(hex::encode(secret).into_bytes());
-    variants.push(hex::encode_upper(secret).into_bytes());
-    variants.push(
-        base64::engine::general_purpose::STANDARD
-            .encode(secret)
-            .into_bytes(),
-    );
-    variants.push(
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(secret)
-            .into_bytes(),
-    );
-    variants.push(
-        secret
-            .iter()
-            .flat_map(|b| format!("%{b:02X}").into_bytes())
-            .collect(),
-    );
+    if secret.len() >= 4 {
+        variants.push(hex::encode(secret).into_bytes());
+        variants.push(hex::encode_upper(secret).into_bytes());
+        variants.push(
+            base64::engine::general_purpose::STANDARD
+                .encode(secret)
+                .into_bytes(),
+        );
+        variants.push(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(secret)
+                .into_bytes(),
+        );
+        // Percent-encoding in both hex cases (RFC 3986 uppercase is
+        // standard; lazy encoders emit lowercase).
+        variants.push(
+            secret
+                .iter()
+                .flat_map(|b| format!("%{b:02X}").into_bytes())
+                .collect(),
+        );
+        variants.push(
+            secret
+                .iter()
+                .flat_map(|b| format!("%{b:02x}").into_bytes())
+                .collect(),
+        );
+    }
+    // JSON string escaping with the standard SHORT escapes first
+    // (Devin: serializers emit \t/\n/\r/\b/\f before \u00XX;
+    // both forms covered) — a tab-containing password must not slip
+    // between them.
     let mut json_escaped = Vec::new();
     for &b in secret {
         match b {
             b'"' => json_escaped.extend_from_slice(b"\\\""),
             b'\\' => json_escaped.extend_from_slice(b"\\\\"),
+            b'\t' => json_escaped.extend_from_slice(b"\\t"),
+            b'\n' => json_escaped.extend_from_slice(b"\\n"),
+            b'\r' => json_escaped.extend_from_slice(b"\\r"),
+            0x08 => json_escaped.extend_from_slice(b"\\b"),
+            0x0C => json_escaped.extend_from_slice(b"\\f"),
             0x20..=0x7E => json_escaped.push(b),
             _ => json_escaped.extend_from_slice(format!("\\u{b:04x}").as_bytes()),
         }
@@ -601,7 +627,7 @@ fn secret_variants(secret: &[u8]) -> Vec<Vec<u8>> {
     variants.push(json_escaped);
     variants.sort();
     variants.dedup();
-    variants.retain(|variant| variant.len() >= 4);
+    variants.retain(|variant| variant.len() >= 4 || variant.as_slice() == secret);
     variants
 }
 
@@ -616,7 +642,11 @@ fn redaction_needles(secrets: &[Vec<u8>]) -> Vec<Vec<u8>> {
     for value in needles.clone() {
         needles.extend(secret_variants(&value));
     }
-    needles.sort();
+    // LONGEST-FIRST (Devin): applying a shorter needle inside a longer
+    // one's text first (e.g. a username that prefixes its password)
+    // breaks the longer match and leaves readable fragments behind.
+    // Longest needles are replaced before their substrings can interfere.
+    needles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     needles.dedup();
     needles
 }
@@ -4610,7 +4640,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
         // token as the 8th double-quoted field) and echoes the pair.
         let binary = write_fake_genpolicy(
             work.path(),
-            "#!/bin/sh\ncut -d'\"' -f8 \"$REGISTRY_AUTH_FILE\" | base64 -d\necho\n",
+            "#!/bin/sh\nPAIR=$(cut -d'\"' -f8 \"$REGISTRY_AUTH_FILE\" | base64 -d)\nprintf '%s\\n' \"$PAIR\"\nprintf '%s' \"$PAIR\" | od -An -tx1 | tr -d ' \\n'; echo\nprintf '%s' \"$PAIR\" | base64 -w0; echo\nprintf '%s' \"$PAIR\" | od -An -tx1 | tr -d ' \\n' | sed 's/../%&/g'; echo\nprintf '%s' \"$PAIR\" | sed 's/\"/\\\\\"/g'; echo\n",
         );
         let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         let subscriber = tracing_subscriber::fmt()
@@ -4640,6 +4670,21 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
             (
                 "the decoded user:password pair",
                 format!("{user}:{password}"),
+            ),
+            (
+                "the hex-encoded pair (emitted)",
+                hex::encode(format!("{user}:{password}")),
+            ),
+            ("the base64-encoded pair (emitted)", {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+            }),
+            (
+                "the percent-encoded pair (emitted)",
+                format!("{user}:{password}")
+                    .bytes()
+                    .map(|b| format!("%{b:02x}"))
+                    .collect::<String>(),
             ),
             ("the decoded password", password.to_string()),
             (
@@ -4701,6 +4746,21 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
         ));
         let percent: String = secret.iter().map(|b| format!("%{b:02X}")).collect();
         assert!(contains(percent.as_bytes()));
+        let percent_lower: String = secret.iter().map(|b| format!("%{b:02x}")).collect();
+        assert!(contains(percent_lower.as_bytes()));
+        // JSON short escapes (Devin T5): a tab must produce \\t, not only \\u0009.
+        let tab_secret = b"pa\tss".to_vec();
+        for variant in secret_variants(&tab_secret) {
+            if variant == b"pa\\tss" {
+                // found
+            }
+        }
+        assert!(
+            secret_variants(&tab_secret)
+                .iter()
+                .any(|variant| variant == b"pa\\tss"),
+            "the JSON short escape of a tab is a needle"
+        );
         let json_escaped: String = secret
             .iter()
             .map(|&b| match b {
@@ -4875,6 +4935,185 @@ exit 101
         assert!(
             ends_before_third_start >= 1,
             "the third child started only after an earlier step released its permit; marker log: {markers}"
+        );
+    }
+
+    #[test]
+    fn overlapping_needles_redact_longest_first() {
+        // (Devin T3): when one needle's text contains another (here the
+        // username is a PREFIX of the password, so the decoded pair embeds
+        // both), a shorter-first pass replaces the inner match first,
+        // breaks the longer needle, and leaves readable fragments
+        // ("-secret-tail" below). Needles are applied LONGEST-FIRST.
+        let work = tempfile::tempdir().unwrap();
+        let user = "abcd";
+        let password = "abcd-secret-tail";
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        fs::write(
+            &auth_file,
+            format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            "#!/bin/sh\ncut -d'\"' -f8 \"$REGISTRY_AUTH_FILE\" | base64 -d\necho\n",
+        );
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    1,
+                    "configured",
+                    "test://t3-image",
+                )
+                .await
+                .unwrap();
+                assert!(success.status.success());
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        assert!(
+            !captured.contains("secret-tail"),
+            "the password fragment survived an overlapping replacement: {captured}"
+        );
+        assert!(
+            !captured.contains("abcd:"),
+            "the pair structure survived: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted]"),
+            "the pair was replaced wholesale: {captured}"
+        );
+    }
+
+    #[test]
+    fn short_credential_values_still_get_redacted() {
+        // (Devin T4): a password under four bytes is still a credential;
+        // the >=4 floor applies only to ENCODING expansion, never to the
+        // raw value needles.
+        let work = tempfile::tempdir().unwrap();
+        let user = "qa";
+        let password = "Zq9";
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        fs::write(
+            &auth_file,
+            format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            "#!/bin/sh\ncut -d'\"' -f8 \"$REGISTRY_AUTH_FILE\" | base64 -d | cut -d: -f2\necho SHORTOK\n",
+        );
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    1,
+                    "configured",
+                    "test://t4-image",
+                )
+                .await
+                .unwrap();
+                assert!(success.status.success());
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        let tail_line = captured
+            .lines()
+            .find(|line| line.contains("stdout_tail="))
+            .expect("a finish line with a tail");
+        let tail_field = tail_line.split("stdout_tail=").nth(1).unwrap_or("");
+        assert!(
+            !tail_field.contains(password),
+            "the 3-byte password survived redaction: {tail_line}"
+        );
+        assert!(
+            tail_field.contains("SHORTOK"),
+            "benign content still logged: {tail_line}"
+        );
+    }
+
+    #[test]
+    fn tab_short_escape_password_is_redacted() {
+        // (Devin T5): serializers emit the SHORT escapes (\\t before
+        // \\u0009); a tab-containing password quoted that way must match a
+        // needle. The child emits the serde-style short-escaped form.
+        let work = tempfile::tempdir().unwrap();
+        let user = "qa-user";
+        let password = "pa\tss-TabX9";
+        use base64::Engine;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        let docker_dir = work.path().join("creds");
+        fs::create_dir_all(&docker_dir).unwrap();
+        let auth_file = docker_dir.join("config.json");
+        fs::write(
+            &auth_file,
+            format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            "#!/bin/sh\ncut -d'\"' -f8 \"$REGISTRY_AUTH_FILE\" | base64 -d | sed 's/\\x09/\\\\t/g'\necho\n",
+        );
+        let logs = SharedLogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let env = Some((auth_file.as_path(), docker_dir.as_path()));
+        tracing::subscriber::with_default(subscriber, || {
+            current_thread_runtime().block_on(async {
+                let success = attempt_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    env,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                    1,
+                    "configured",
+                    "test://t5-image",
+                )
+                .await
+                .unwrap();
+                assert!(success.status.success());
+            })
+        });
+        let captured = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        assert!(
+            !captured.contains("TabX9"),
+            "the tab-containing password survived its JSON short-escape quoting: {captured}"
+        );
+        assert!(
+            captured.contains("[redacted]"),
+            "the short-escaped form was redacted: {captured}"
         );
     }
 }
