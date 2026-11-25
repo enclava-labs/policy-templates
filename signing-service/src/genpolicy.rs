@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::Output,
 };
 
 use anyhow::{bail, Context, Result};
@@ -194,6 +194,13 @@ pub struct GenpolicyConfig {
     pub version_pin: String,
     pub rules_path: PathBuf,
     pub settings_dir: Option<PathBuf>,
+    /// Hard TOTAL budget for one genpolicy step (both attempts together).
+    /// 90 s sits under cap's 120 s signing client timeout
+    /// (PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS) with room for the rest of
+    /// /sign (descriptor verification, key operations) and for the
+    /// attributable timeout error to reach the caller. Injected so tests
+    /// can shrink it.
+    pub total_budget: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +233,7 @@ impl GenpolicyConfig {
             version_pin,
             rules_path: PathBuf::from(rules_path),
             settings_dir,
+            total_budget: DEFAULT_GENPOLICY_TOTAL_BUDGET,
         }
     }
 
@@ -269,11 +277,11 @@ impl GenpolicyConfig {
         })
     }
 
-    pub fn run(&self, descriptor: &DeploymentDescriptor) -> Result<GeneratedAgentPolicy> {
-        self.run_with_log_encryption(descriptor, None)
+    pub async fn run(&self, descriptor: &DeploymentDescriptor) -> Result<GeneratedAgentPolicy> {
+        self.run_with_log_encryption(descriptor, None).await
     }
 
-    pub fn run_with_log_encryption(
+    pub async fn run_with_log_encryption(
         &self,
         descriptor: &DeploymentDescriptor,
         log_encryption: Option<&LogEncryptionConfig>,
@@ -302,7 +310,7 @@ impl GenpolicyConfig {
             args.push(settings_dir.display().to_string());
         }
 
-        let output = run_genpolicy(&self.binary, &args, dir.path())?;
+        let output = run_genpolicy(&self.binary, &args, dir.path(), self.total_budget).await?;
         if !output.status.success() {
             bail!(
                 "genpolicy failed with status {}: {}",
@@ -400,15 +408,128 @@ fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String>
     ))
 }
 
-fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Output> {
-    let run = |command: &mut Command| {
-        command
-            .args(args)
-            .current_dir(work_dir)
-            .output()
-            .with_context(|| format!("executing genpolicy binary {}", binary.display()))
+/// The production genpolicy budget (see `GenpolicyConfig::total_budget`).
+pub const DEFAULT_GENPOLICY_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
+#[cfg(unix)]
+fn new_command(binary: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    // Own process group (tokio::process::Command::process_group): a
+    // stalled genpolicy that spawned helpers must be killed as a GROUP on
+    // expiry, not leave orphans behind.
+    command.process_group(0);
+    command
+}
+
+#[cfg(not(unix))]
+fn new_command(binary: &Path) -> tokio::process::Command {
+    tokio::process::Command::new(binary)
+}
+
+/// Kill the child's whole process group (the child plus any helpers it
+/// spawned). Best effort: failures are logged, never fatal — the budget
+/// error is the answer either way.
+async fn kill_process_group_by_pid(pid: Option<u32>, attempt: u8) {
+    let Some(pid) = pid else {
+        return;
     };
-    let output = run(&mut Command::new(binary))?;
+    // kill_on_drop already terminates the direct child when the Child is
+    // dropped inside the timed-out future; the group TERM covers helpers
+    // the child spawned. Best effort: failures are logged, never fatal —
+    // the budget error is the answer either way.
+    let kill = tokio::process::Command::new("kill")
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .output()
+        .await;
+    if let Ok(output) = &kill {
+        if !output.status.success() {
+            tracing::warn!(
+                pid,
+                attempt,
+                status = ?output.status,
+                "process-group TERM failed; the direct child is covered by kill_on_drop"
+            );
+        }
+    }
+}
+
+/// One budgeted, non-blocking genpolicy attempt. INFO logs bracket every
+/// invocation (attempt number, auth mode, exit status, duration,
+/// stdout/stderr BYTE counts — never contents); on expiry the process
+/// group is killed and the error names the attempt and the elapsed time.
+async fn attempt_genpolicy(
+    binary: &Path,
+    args: &[String],
+    work_dir: &Path,
+    env: Option<(&Path, &Path)>,
+    deadline: tokio::time::Instant,
+    attempt_no: u8,
+    auth_mode: &'static str,
+) -> Result<Output> {
+    let started = tokio::time::Instant::now();
+    tracing::info!(
+        attempt = attempt_no,
+        auth = auth_mode,
+        binary = %binary.display(),
+        "genpolicy invocation starting"
+    );
+    let mut command = new_command(binary);
+    command
+        .args(args)
+        .current_dir(work_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some((auth_file, docker_dir)) = env {
+        command
+            .env("REGISTRY_AUTH_FILE", auth_file)
+            .env("DOCKER_CONFIG", docker_dir);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("executing genpolicy binary {}", binary.display()))?;
+    // Capture the pid BEFORE the wait: `wait_with_output` consumes the
+    // Child, so the group kill on expiry works from the pid alone.
+    let pid = child.id();
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match tokio::time::timeout(remaining, child.wait_with_output()).await {
+        Ok(result) => {
+            let output = result
+                .with_context(|| format!("waiting for genpolicy binary {}", binary.display()))?;
+            tracing::info!(
+                attempt = attempt_no,
+                auth = auth_mode,
+                status = ?output.status,
+                duration_ms = started.elapsed().as_millis() as u64,
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "genpolicy invocation finished"
+            );
+            Ok(output)
+        }
+        Err(_) => {
+            kill_process_group_by_pid(pid, attempt_no).await;
+            let elapsed = started.elapsed();
+            bail!(
+                "genpolicy timed out: attempt {attempt_no} (auth: {auth_mode}) exceeded the total budget; elapsed {elapsed:?}"
+            );
+        }
+    }
+}
+
+/// Run genpolicy — attempt 1 with the configured environment, attempt 2
+/// with the anonymous-registry auth env on non-success — under one TOTAL
+/// budget for both attempts, never blocking a runtime worker.
+async fn run_genpolicy(
+    binary: &Path,
+    args: &[String],
+    work_dir: &Path,
+    total_budget: std::time::Duration,
+) -> Result<Output> {
+    let deadline = tokio::time::Instant::now() + total_budget;
+    let output = attempt_genpolicy(binary, args, work_dir, None, deadline, 1, "configured").await?;
     if output.status.success() {
         return Ok(output);
     }
@@ -417,9 +538,16 @@ fn run_genpolicy(binary: &Path, args: &[String], work_dir: &Path) -> Result<Outp
     fs::create_dir_all(&docker_dir).context("creating anonymous registry config directory")?;
     let auth_file = docker_dir.join("config.json");
     fs::write(&auth_file, br#"{"auths":{}}"#).context("writing anonymous registry config")?;
-    run(Command::new(binary)
-        .env("REGISTRY_AUTH_FILE", &auth_file)
-        .env("DOCKER_CONFIG", &docker_dir))
+    attempt_genpolicy(
+        binary,
+        args,
+        work_dir,
+        Some((&auth_file, &docker_dir)),
+        deadline,
+        2,
+        "anonymous-registry",
+    )
+    .await
 }
 
 fn prepare_cap_settings_dir(source_dir: &Path, work_dir: &Path) -> Result<PathBuf> {
@@ -1683,6 +1811,8 @@ mod tests {
     use crate::descriptor::{
         tests::fixed_descriptor, Capabilities, EnvVar, Mount, SecurityContext,
     };
+    #[allow(unused_imports)]
+    use std::process::Command;
 
     fn synthetic_memory_policy() -> String {
         let mut containers = [
@@ -2208,6 +2338,9 @@ allowed if {
     #[test]
     #[cfg(unix)]
     fn public_registry_pull_retries_without_rejected_credentials() {
+        // (d3) the anonymous-registry retry path still works: the first
+        // attempt fails fast, the second succeeds with the anonymous
+        // config — now under the budgeted async runner.
         use std::os::unix::fs::PermissionsExt;
 
         let work = tempfile::tempdir().unwrap();
@@ -2230,7 +2363,20 @@ exit 101
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let output = run_genpolicy(&binary, &[], work.path()).unwrap();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            })
+            .unwrap();
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"anonymous policy");
@@ -2293,6 +2439,7 @@ exit 101
             version_pin: "kata-containers-3.12.0".to_string(),
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
+            total_budget: std::time::Duration::from_secs(30),
         };
         let invocation = config.build_invocation(&fixed_descriptor()).unwrap();
 
@@ -2475,6 +2622,7 @@ exit 101
             version_pin: "kata-containers-3.12.0".to_string(),
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
+            total_budget: std::time::Duration::from_secs(30),
         };
         let descriptor = small_descriptor();
         assert!(is_small_shape(&descriptor));
@@ -2545,6 +2693,7 @@ exit 101
             version_pin: "kata-containers-3.12.0".to_string(),
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: Some(PathBuf::from("/etc/enclava/genpolicy")),
+            total_budget: std::time::Duration::from_secs(30),
         };
         let invocation = config
             .build_invocation(&descriptor_with_cpu_limit("100m"))
@@ -2629,6 +2778,7 @@ exit 101
             version_pin: "kata-containers-3.12.0".to_string(),
             rules_path: PathBuf::from("/etc/enclava/genpolicy/rules.rego"),
             settings_dir: None,
+            total_budget: std::time::Duration::from_secs(30),
         };
         let descriptor = duplicate_limits_descriptor();
         let err = config.build_invocation(&descriptor).unwrap_err();
@@ -3385,6 +3535,7 @@ exit 101
             version_pin: "kata-containers/genpolicy-unpinned-dev".to_string(),
             rules_path: PathBuf::from("rules.rego"),
             settings_dir: None,
+            total_budget: std::time::Duration::from_secs(30),
         };
         assert!(config.require_pinned_version().is_err());
     }
@@ -3603,9 +3754,17 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
             public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
         };
         // Both production generation entry points (main.rs): plain and log-encrypted.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let sizes = [
-            config.run(&descriptor),
-            config.run_with_log_encryption(&descriptor, Some(&log_encryption)),
+            runtime.block_on(config.run(&descriptor)),
+            runtime.block_on(async {
+                config
+                    .run_with_log_encryption(&descriptor, Some(&log_encryption))
+                    .await
+            }),
         ]
         .map(|result| {
             result
@@ -3642,5 +3801,123 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
             CADDY_INGRESS_IMAGE_REPO,
             "ghcr.io/enclava-labs/caddy-ingress"
         );
+    }
+
+    fn write_fake_genpolicy(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.join("fake-genpolicy");
+        fs::write(&binary, body).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    fn current_thread_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn stalled_genpolicy_fails_inside_the_budget_with_the_attempt_named() {
+        // (d1) The outage shape: a genpolicy child that never exits. The
+        // step fails FAST (inside the injected budget) with an error that
+        // names the attempt and the budget — never an unbounded wait.
+        let work = tempfile::tempdir().unwrap();
+        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 300\n");
+        let started = std::time::Instant::now();
+        let error = current_thread_runtime()
+            .block_on(async {
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    std::time::Duration::from_millis(300),
+                )
+                .await
+            })
+            .expect_err("a stalled child must hit the budget");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("genpolicy timed out: attempt 1"),
+            "error must name the attempt: {rendered}"
+        );
+        assert!(
+            rendered.contains("exceeded the total budget"),
+            "error must name the budget: {rendered}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "returned inside the budget, not after the child's 300 s sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_style_work_answers_while_genpolicy_child_is_stalled() {
+        // (d2) The worker-parking proof: while a stalled genpolicy child
+        // is being waited on, the SAME runtime keeps answering async work
+        // (the /healthz shape — a constant response with no blocking
+        // dependency). Under the old std::process::output() call this
+        // hung; under tokio::process the wait yields.
+        let work = tempfile::tempdir().unwrap();
+        let binary = write_fake_genpolicy(work.path(), "#!/bin/sh\nsleep 5\n");
+        let genpolicy = async {
+            run_genpolicy(
+                &binary,
+                &[],
+                work.path(),
+                std::time::Duration::from_millis(250),
+            )
+            .await
+        };
+        let healthz = async {
+            let mut answered = 0;
+            for _ in 0..5 {
+                // The healthz handler's shape: constant JSON, no awaits
+                // on the child. If the genpolicy wait parked the only
+                // worker (single-threaded runtime!), these ticks would
+                // never run before the budget error.
+                tokio::task::yield_now().await;
+                answered += 1;
+            }
+            answered
+        };
+        let (result, answered) = tokio::join!(genpolicy, healthz);
+        assert!(result.is_err(), "the stalled child hits the budget");
+        assert_eq!(answered, 5, "async work kept answering on the same runtime");
+    }
+
+    #[test]
+    fn first_attempt_failure_succeeds_through_the_anonymous_retry() {
+        // (d3) The retry path under the async runner: attempt 1 fails
+        // fast, attempt 2 (anonymous-registry env) succeeds.
+        let work = tempfile::tempdir().unwrap();
+        let binary = write_fake_genpolicy(
+            work.path(),
+            r#"#!/bin/sh
+case "$REGISTRY_AUTH_FILE" in
+  */anonymous-registry/config.json)
+    test "$(cat "$REGISTRY_AUTH_FILE")" = '{"auths":{}}'
+    printf 'anonymous policy'
+    exit 0
+    ;;
+esac
+echo registry client failed >&2
+exit 101
+"#,
+        );
+        let output = current_thread_runtime()
+            .block_on(async {
+                run_genpolicy(
+                    &binary,
+                    &[],
+                    work.path(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+            })
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"anonymous policy");
     }
 }

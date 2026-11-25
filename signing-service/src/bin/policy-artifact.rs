@@ -12,6 +12,12 @@ use enclava_policy_signing_service::{
 };
 
 fn main() -> Result<()> {
+    // The genpolicy invocation is async; the CLI binary drives a minimal
+    // single-threaded runtime for it (same blocking UX for the operator).
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building the policy-artifact runtime")?;
     let args = Args::parse(env::args().skip(1).collect())?;
     let request: SignRequest = serde_json::from_slice(
         &std::fs::read(&args.request)
@@ -33,7 +39,8 @@ fn main() -> Result<()> {
         bail!("artifact signing key must match descriptor_signing_pubkey");
     }
 
-    let generated_agent_policy = GenpolicyConfig::from_env().run(&inputs.descriptor)?;
+    let generated_agent_policy =
+        runtime.block_on(async { GenpolicyConfig::from_env().run(&inputs.descriptor).await })?;
     let signed_at = args
         .signed_at
         .map(|value| DateTime::parse_from_rfc3339(&value).map(|dt| dt.with_timezone(&Utc)))
