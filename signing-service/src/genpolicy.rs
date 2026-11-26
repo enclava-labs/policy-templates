@@ -221,6 +221,12 @@ pub struct GenpolicyInvocation {
 pub struct GeneratedAgentPolicy {
     pub policy_text: String,
     pub invocation: GenpolicyInvocation,
+    /// Effective pod-level supplemental groups when this policy came from
+    /// the guest-pull group discovery (contract v1, policy-templates#23):
+    /// the sorted-unique list the working copy actually used. Absent for
+    /// every legacy generation path. The client contract: merge the field
+    /// into the descriptor, re-call, use only the policy from the re-call.
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 impl GenpolicyConfig {
@@ -288,17 +294,20 @@ impl GenpolicyConfig {
         self.run_with_log_encryption(descriptor, None).await
     }
 
+    fn permits(&self) -> &tokio::sync::Semaphore {
+        // Explicit concurrency cap: waiting requests queue here instead of
+        // each starting a generator under the same container limits
+        // (Devin T5). One shared semaphore for every generation path.
+        static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+        PERMITS.get_or_init(|| tokio::sync::Semaphore::new(std::cmp::max(1, self.max_concurrent)))
+    }
+
     pub async fn run_with_log_encryption(
         &self,
         descriptor: &DeploymentDescriptor,
         log_encryption: Option<&LogEncryptionConfig>,
     ) -> Result<GeneratedAgentPolicy> {
-        // Explicit concurrency cap: waiting requests queue here instead of
-        // each starting a generator under the same container limits
-        // (Devin T5).
-        static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-        let semaphore = PERMITS
-            .get_or_init(|| tokio::sync::Semaphore::new(std::cmp::max(1, self.max_concurrent)));
+        let semaphore = self.permits();
         let invocation = self.build_invocation_with_log_encryption(descriptor, log_encryption)?;
         let dir = tempfile::tempdir().context("creating genpolicy work dir")?;
         let manifest_path = dir.path().join("pod.yaml");
@@ -345,8 +354,230 @@ impl GenpolicyConfig {
         Ok(GeneratedAgentPolicy {
             policy_text: normalize_cap_generated_policy(&policy_text),
             invocation,
+            pod_supplemental_groups: None,
         })
     }
+
+    /// Contract v1 (policy-templates#23): capability-gated DISCOVERY of
+    /// the pod-level supplemental groups genpolicy requires for a
+    /// guest-pulled image whose user carries extra group memberships.
+    /// DISCOVERY ONLY — never a silent signing-side repair: the effective
+    /// groups are returned to the caller (pod_supplemental_groups), which
+    /// merges them into the descriptor and re-calls; only the re-call's
+    /// policy is final. When the descriptor already DECLARES groups, or
+    /// the caller did not declare the capability, a guest-pull failure
+    /// returns the typed GuestPullGroupsError instead of any retry.
+    /// Every run — first and retries — stays inside the ONE total budget.
+    pub async fn run_with_pod_group_discovery(
+        &self,
+        descriptor: &DeploymentDescriptor,
+        log_encryption: Option<&LogEncryptionConfig>,
+        supports_pod_supplemental_groups: bool,
+    ) -> Result<GeneratedAgentPolicy> {
+        let semaphore = self.permits();
+        let invocation = self.build_invocation_with_log_encryption(descriptor, log_encryption)?;
+        let dir = tempfile::tempdir().context("creating genpolicy work dir")?;
+        let manifest_path = dir.path().join("pod.yaml");
+        std::fs::write(&manifest_path, &invocation.manifest_yaml)
+            .with_context(|| format!("writing {}", manifest_path.display()))?;
+        let effective_settings_dir = if let Some(settings_dir) = &self.settings_dir {
+            Some(prepare_cap_settings_dir(settings_dir, dir.path())?)
+        } else {
+            None
+        };
+        let mut args = vec![
+            "-y".to_string(),
+            manifest_path.display().to_string(),
+            "-p".to_string(),
+            self.rules_path.display().to_string(),
+            "-r".to_string(),
+        ];
+        if let Some(settings_dir) = &effective_settings_dir {
+            args.push("-j".to_string());
+            args.push(settings_dir.display().to_string());
+        }
+
+        let declared = descriptor.pod_supplemental_groups.clone();
+        let discovery_enabled = supports_pod_supplemental_groups && declared.is_none();
+        // Bound: at most (initContainers + containers + 1) genpolicy runs —
+        // each failing container can add at most one delta before the run
+        // either succeeds or the bound fails the step.
+        let manifest: serde_yaml::Value = serde_yaml::from_str(&invocation.manifest_yaml)
+            .context("parsing the rendered pod manifest")?;
+        let list_len = |key: &str| {
+            manifest
+                .get("spec")
+                .and_then(|spec| spec.get(key))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|list| list.len())
+                .unwrap_or(0)
+        };
+        let max_runs = list_len("containers") + list_len("initContainers") + 1;
+
+        // The total budget is ONE deadline shared by every run.
+        let deadline = tokio::time::Instant::now() + self.total_budget;
+        let mut working_manifest = invocation.manifest_yaml.clone();
+        let mut effective_groups: Option<Vec<i64>> = None;
+        let mut runs = 0usize;
+        let output = loop {
+            runs += 1;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let output = run_genpolicy(
+                &self.binary,
+                &args,
+                dir.path(),
+                remaining,
+                Some(semaphore),
+                &descriptor.image_ref,
+            )
+            .await?;
+            if output.status.success() {
+                break output;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("guest_pull is enabled for container") {
+                // Not the guest-pull class: today's error path, unchanged.
+                break output;
+            }
+            let delta = parse_guest_pull_delta(&stderr);
+            let missing = delta.clone().unwrap_or_default();
+            if !discovery_enabled {
+                // Descriptor already declares groups, or the caller lacks
+                // the capability: no silent repair, typed error either way.
+                let code = if declared.is_some() {
+                    "pod_supplemental_groups_insufficient"
+                } else {
+                    "genpolicy_guest_pull_groups_required"
+                };
+                bail!(GuestPullGroupsError { code, missing });
+            }
+            let Some(delta) = delta else {
+                // Malformed recommendation (non-integer, empty, or > 32
+                // entries): fail closed — no retry, today's error text.
+                break output;
+            };
+            if runs >= max_runs {
+                // Insufficient discovery within the iteration bound.
+                bail!(GuestPullGroupsError {
+                    code: "genpolicy_guest_pull_groups_required",
+                    missing,
+                });
+            }
+            tracing::info!(
+                delta = ?delta,
+                run = runs,
+                "genpolicy guest-pull group discovery: unioning the recommendation into the pod-level list"
+            );
+            let (patched, effective) = union_pod_supplemental_groups(&working_manifest, &delta)?;
+            working_manifest = patched;
+            effective_groups = Some(effective);
+            std::fs::write(&manifest_path, &working_manifest)
+                .with_context(|| format!("writing {}", manifest_path.display()))?;
+        };
+        if !output.status.success() {
+            bail!(
+                "genpolicy failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let policy_text =
+            String::from_utf8(output.stdout).context("genpolicy output is not UTF-8")?;
+        let policy_text = normalize_guest_memory_mount_propagation(&policy_text)?;
+        Ok(GeneratedAgentPolicy {
+            policy_text: normalize_cap_generated_policy(&policy_text),
+            invocation,
+            pod_supplemental_groups: effective_groups,
+        })
+    }
+}
+
+/// Typed error for the guest-pull group class (contract v1,
+/// policy-templates#23). `code` is the wire token CAP maps:
+/// - `genpolicy_guest_pull_groups_required`: the caller did not declare
+///   the capability (or did not send the field), so no discovery ran and
+///   the groups cannot be supplied silently;
+/// - `pod_supplemental_groups_insufficient`: the descriptor already
+///   DECLARES groups and genpolicy still failed — the declared set is
+///   insufficient; discovery is disabled by contract (never a silent
+///   repair of a declared descriptor).
+///
+/// `missing` carries the delta parsed from genpolicy's recommendation.
+#[derive(Debug)]
+pub struct GuestPullGroupsError {
+    pub code: &'static str,
+    pub missing: Vec<i64>,
+}
+
+impl std::fmt::Display for GuestPullGroupsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: missing pod supplemental groups {:?}",
+            self.code, self.missing
+        )
+    }
+}
+impl std::error::Error for GuestPullGroupsError {}
+
+/// STRICT parse of genpolicy's recommendation delta line
+/// (`supplementalGroups: [a, b]`, integers only, 1..=32 entries). Anything
+/// else -> None: fail closed, no retry.
+fn parse_guest_pull_delta(stderr: &str) -> Option<Vec<i64>> {
+    const RECOMMENDATION: &str = "supplementalGroups: [";
+    let start = stderr.rfind(RECOMMENDATION)? + RECOMMENDATION.len();
+    let close = stderr[start..].find(']')? + start;
+    let list: Option<Vec<i64>> = stderr[start..close]
+        .split(',')
+        .map(|value| value.trim().parse::<i64>().ok())
+        .collect();
+    let list = list?;
+    if list.is_empty() || list.len() > 32 {
+        return None;
+    }
+    Some(list)
+}
+
+/// Union the parsed delta into the WORKING COPY's pod-level
+/// spec.securityContext.supplementalGroups (never container level:
+/// genpolicy 4.3.1 panics on container-level supplementalGroups). Returns
+/// the patched manifest and the effective list, sorted unique.
+fn union_pod_supplemental_groups(manifest_yaml: &str, delta: &[i64]) -> Result<(String, Vec<i64>)> {
+    let mut manifest: serde_yaml::Value = serde_yaml::from_str(manifest_yaml)
+        .context("parsing the pod manifest for the guest-pull group discovery")?;
+    let security = manifest
+        .get_mut("spec")
+        .and_then(|spec| spec.get_mut("securityContext"))
+        .context("pod manifest has no spec.securityContext to union groups into")?;
+    let security_map = match security {
+        serde_yaml::Value::Mapping(map) => map,
+        _ => bail!("pod manifest spec.securityContext is not a mapping"),
+    };
+    let mut effective: Vec<i64> = match security_map.get("supplementalGroups") {
+        Some(serde_yaml::Value::Sequence(items)) => {
+            items.iter().filter_map(|value| value.as_i64()).collect()
+        }
+        _ => bail!("pod manifest has no pod-level supplementalGroups list"),
+    };
+    for group in delta {
+        if !effective.contains(group) {
+            effective.push(*group);
+        }
+    }
+    effective.sort_unstable();
+    effective.dedup();
+    security_map.insert(
+        "supplementalGroups".into(),
+        serde_yaml::Value::Sequence(
+            effective
+                .iter()
+                .map(|group| serde_yaml::Value::Number((*group).into()))
+                .collect(),
+        ),
+    );
+    let patched =
+        serde_yaml::to_string(&manifest).context("serializing the normalized pod manifest")?;
+    Ok((patched, effective))
 }
 
 fn normalize_guest_memory_mount_propagation(policy_text: &str) -> Result<String> {
@@ -1402,8 +1633,14 @@ fn render_pod_manifest(
                 "fsGroup": 10001,
                 // genpolicy 4.3.1 (guest_pull) always encodes the default GID 0 in
                 // AdditionalGids and refuses generation unless the pod spec can
-                // reproduce it in-guest.
-                "supplementalGroups": [0, 6],
+                // reproduce it in-guest. A descriptor that DECLARES
+                // pod_supplemental_groups (contract v1) renders its list
+                // verbatim; the platform baseline [0, 6] stays the default.
+                // Container-level runAsUser/runAsGroup are never touched.
+                "supplementalGroups": match &descriptor.pod_supplemental_groups {
+                    Some(declared) => json!(declared),
+                    None => json!([0, 6]),
+                },
             },
             "initContainers": [
                 enclava_tools_container(log_encryption.is_some())?,
@@ -5197,6 +5434,222 @@ exit 101
         );
     }
 
+    /// Shell body for the guest-pull normalizer fakes: records every
+    /// invocation (count + manifest snapshot) under the witness dir, then
+    /// succeeds when `until` matches the manifest, or prints `errors` and
+    /// exits 1.
+    fn normalizer_fake_body(witness: &str, until: &str, errors: &str) -> String {
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "manifest=\n",
+                "prev=\n",
+                "for a in \"$@\"; do\n",
+                "  if [ \"$prev\" = \"-y\" ]; then manifest=\"$a\"; fi\n",
+                "  prev=\"$a\"\n",
+                "done\n",
+                "n=$(cat {witness}/count 2>/dev/null || echo 0); n=$((n+1)); echo $n > {witness}/count\n",
+                "cp \"$manifest\" {witness}/seen-$n.yaml\n",
+                "if {until}; then\n",
+                // The success output cats a full synthetic policy (the
+                // guest-memory normalization requires the real shape).
+                "  echo \"NORMALIZER-POLICY-OK\"\n",
+                "  cat {witness}/success-policy.txt\n",
+                "  exit 0\n",
+                "fi\n",
+                "{errors}\n",
+                "exit 1\n"
+            ),
+            witness = witness,
+            until = until,
+            errors = errors
+        )
+    }
+
+    fn normalizer_config(binary: PathBuf, budget: std::time::Duration) -> GenpolicyConfig {
+        GenpolicyConfig {
+            binary,
+            version_pin: "kata-containers/genpolicy@4.3.1".to_string(),
+            rules_path: PathBuf::from("/nonexistent/rules.rego"),
+            settings_dir: None,
+            total_budget: budget,
+            max_concurrent: 2,
+        }
+    }
+
+    fn read_witness_u64(work: &Path, name: &str) -> u64 {
+        fs::read_to_string(work.join(name))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn manifest_container<'a>(
+        manifest: &'a serde_yaml::Value,
+        name: &str,
+    ) -> Option<&'a serde_yaml::Value> {
+        manifest
+            .get("spec")?
+            .get("containers")?
+            .as_sequence()?
+            .iter()
+            .find(|container| container.get("name").and_then(|n| n.as_str()) == Some(name))
+    }
+
+    #[test]
+    fn discovery_t1_unions_the_delta_at_pod_level_and_returns_the_groups() {
+        // (T1) One guest-pull failure (delta [27]): the retry's pod.yaml
+        // carries POD-level [0, 6, 27] — nothing at container level
+        // (genpolicy 4.3.1 panics on container-level placement) — and the
+        // generated policy response carries pod_supplemental_groups
+        // [0, 6, 27] for the client to merge and re-call.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "grep -q -- '- 27' \"$manifest\"", "printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2");
+        fs::write(
+            work.path().join("success-policy.txt"),
+            synthetic_memory_policy(),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let generated = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, true)
+                    .await
+            })
+            .expect("the discovery retry succeeds");
+        assert!(generated.policy_text.contains("NORMALIZER-POLICY-OK"));
+        assert_eq!(
+            generated.pod_supplemental_groups,
+            Some(vec![0, 6, 27]),
+            "the response carries the effective pod-level list"
+        );
+        assert_eq!(read_witness_u64(work.path(), "count"), 3);
+        let retry_manifest: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-3.yaml")).unwrap())
+                .unwrap();
+        let pod_groups: Vec<i64> = retry_manifest
+            .get("spec")
+            .and_then(|spec| spec.get("securityContext"))
+            .and_then(|s| s.get("supplementalGroups"))
+            .and_then(|v| v.as_sequence())
+            .expect("pod-level supplementalGroups")
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(pod_groups, vec![0, 6, 27]);
+        // NOTHING at container level.
+        for name in ["web", "attestation-proxy", "tenant-ingress", "enclava-init"] {
+            let container = manifest_container(&retry_manifest, name);
+            if let Some(security) = container.and_then(|c| c.get("securityContext")) {
+                assert!(
+                    security.get("supplementalGroups").is_none(),
+                    "{name} must not carry container-level supplementalGroups"
+                );
+            }
+        }
+        // fsGroup untouched.
+        assert_eq!(
+            retry_manifest
+                .get("spec")
+                .and_then(|spec| spec.get("securityContext"))
+                .and_then(|s| s.get("fsGroup"))
+                .and_then(|v| v.as_i64()),
+            Some(10001)
+        );
+        // The FIRST run's manifest predates the patch.
+        let first: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-1.yaml")).unwrap())
+                .unwrap();
+        let first_groups: Vec<i64> = first
+            .get("spec")
+            .and_then(|spec| spec.get("securityContext"))
+            .and_then(|s| s.get("supplementalGroups"))
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(first_groups, vec![0, 6]);
+    }
+
+    #[test]
+    fn discovery_t2_accumulates_two_deltas_across_containers() {
+        // (T2) Two deltas ([27], then [55]) across two failing runs: the
+        // final pod-level list is [0, 6, 27, 55].
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "grep -q -- '- 55' \"$manifest\"", "if grep -q -- '- 27' \"$manifest\"; then printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 55, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [55]\" >&2\necho >&2; else printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2; fi");
+        fs::write(
+            work.path().join("success-policy.txt"),
+            synthetic_memory_policy(),
+        )
+        .unwrap();
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let generated = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, true)
+                    .await
+            })
+            .expect("both deltas discovered");
+        assert_eq!(generated.pod_supplemental_groups, Some(vec![0, 6, 27, 55]));
+        assert_eq!(read_witness_u64(work.path(), "count"), 5);
+        let final_manifest: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-5.yaml")).unwrap())
+                .unwrap();
+        let pod_groups: Vec<i64> = final_manifest
+            .get("spec")
+            .and_then(|spec| spec.get("securityContext"))
+            .and_then(|s| s.get("supplementalGroups"))
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(pod_groups, vec![0, 6, 27, 55]);
+    }
+
+    #[test]
+    fn discovery_t3_legacy_capability_never_retries_and_types_the_error() {
+        // (T3) capability=false: no retry; the guest-pull failure returns
+        // the typed genpolicy_guest_pull_groups_required error carrying
+        // the missing delta.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "false", "printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2");
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let error = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, false)
+                    .await
+            })
+            .expect_err("legacy capability: typed error, no repair");
+        let typed = error
+            .downcast_ref::<GuestPullGroupsError>()
+            .expect("the typed error survives the anyhow chain");
+        assert_eq!(typed.code, "genpolicy_guest_pull_groups_required");
+        assert_eq!(typed.missing, vec![27]);
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(
+                "genpolicy_guest_pull_groups_required: missing pod supplemental groups [27]"
+            ),
+            "wire text: {rendered}"
+        );
+        assert_eq!(
+            read_witness_u64(work.path(), "count"),
+            2,
+            "two auth attempts only — no discovery run"
+        );
+    }
+
     #[test]
     fn wrapped_base64_default_wrap_is_redacted() {
         // (R2 item 1, critical): `base64 "$REGISTRY_AUTH_FILE"` with NO
@@ -5379,5 +5832,175 @@ exit 101
             captured.contains("[redacted]"),
             "the short-escaped form was redacted: {captured}"
         );
+    }
+
+    #[test]
+    fn discovery_t4_declared_groups_disable_discovery_with_typed_error() {
+        // (T4) The descriptor already declares groups: the manifest
+        // renders the DECLARED list (mirror), discovery is disabled, and
+        // a guest-pull failure returns pod_supplemental_groups_insufficient.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "false", "printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2");
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let mut descriptor = fixed_descriptor();
+        descriptor.pod_supplemental_groups = Some(vec![0, 6, 33]);
+        let error = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&descriptor, None, true)
+                    .await
+            })
+            .expect_err("declared groups: no silent repair");
+        let typed = error
+            .downcast_ref::<GuestPullGroupsError>()
+            .expect("typed error");
+        assert_eq!(typed.code, "pod_supplemental_groups_insufficient");
+        assert_eq!(typed.missing, vec![27]);
+        assert_eq!(
+            read_witness_u64(work.path(), "count"),
+            2,
+            "no discovery run"
+        );
+        // The mirror rendered the DECLARED list verbatim.
+        let seen: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(work.path().join("seen-1.yaml")).unwrap())
+                .unwrap();
+        let pod_groups: Vec<i64> = seen
+            .get("spec")
+            .and_then(|spec| spec.get("securityContext"))
+            .and_then(|s| s.get("supplementalGroups"))
+            .and_then(|v| v.as_sequence())
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_i64())
+            .collect();
+        assert_eq!(pod_groups, vec![0, 6, 33]);
+    }
+
+    #[test]
+    fn discovery_t5_non_guest_pull_failures_keep_todays_error() {
+        // (T5) A non-guest-pull exit-1: no retry, today's generic error.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(
+            &witness,
+            "false",
+            "echo \"ERROR: rules violation: unrelated failure\" >&2",
+        );
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let error = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, true)
+                    .await
+            })
+            .expect_err("unrelated failure surfaces unchanged");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("rules violation: unrelated failure"));
+        assert!(error.downcast_ref::<GuestPullGroupsError>().is_none());
+        assert_eq!(read_witness_u64(work.path(), "count"), 2);
+    }
+
+    #[test]
+    fn discovery_t6_malformed_recommendations_fail_closed() {
+        // (T6) Malformed recommendations (non-integer entries, or more
+        // than 32): fail closed — no retry, today's generic error.
+        for (label, errors) in [
+            ("non-integer entry", "printf \"%s\" \"ERROR: guest_pull is enabled for container 'web'. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27, abc]\" >&2\necho >&2"),
+            ("thirty-three entries", "printf \"%s\" \"ERROR: guest_pull is enabled for container 'web'. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\" >&2\necho >&2"),
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            let witness = work.path().display().to_string();
+            let body = normalizer_fake_body(&witness, "false", errors);
+            let binary = write_fake_genpolicy(work.path(), &body);
+            let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+            let error = current_thread_runtime()
+                .block_on(async {
+                    config
+                        .run_with_pod_group_discovery(&fixed_descriptor(), None, true)
+                        .await
+                })
+                .expect_err("malformed recommendation fails closed");
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("genpolicy failed with status"),
+                "{label}: today's generic error, no typed repair: {rendered}"
+            );
+            assert!(error.downcast_ref::<GuestPullGroupsError>().is_none());
+            assert_eq!(read_witness_u64(work.path(), "count"), 2, "{label}: no discovery run");
+        }
+    }
+
+    #[test]
+    fn discovery_t7_the_budget_is_shared_across_discovery_runs() {
+        // (T7) A slow first run leaves the retry inside the SAME deadline:
+        // a stalling discovery retry is killed by the shared budget, not a
+        // fresh one.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "false", "if [ -n \"$REGISTRY_AUTH_FILE\" ]; then printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2; exit 1; fi; sleep 0.8; printf \"%s\" \"ERROR: guest_pull is enabled for container 'web' using image 'ghcr.io/enclava-labs/debian-ssh-frp@sha256:c5e0f9f8'. The generated policy expects UID=10001, GID=10001, AdditionalGids={0, 6, 27, 10001}; containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. Set explicit Kubernetes securityContext values, for example: securityContext: supplementalGroups: [27]\" >&2\necho >&2; exit 1");
+        let binary = write_fake_genpolicy(work.path(), &body);
+        let config = normalizer_config(binary, std::time::Duration::from_millis(1200));
+        let started = std::time::Instant::now();
+        let error = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, true)
+                    .await
+            })
+            .expect_err("the stalling discovery retry is killed by the shared budget");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("genpolicy timed out: attempt 1"),
+            "the discovery retry hits the shared deadline: {rendered}"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "total elapsed {elapsed:?} stays inside ~1.5x the 1200ms budget"
+        );
+        assert_eq!(read_witness_u64(work.path(), "count"), 3);
+    }
+
+    #[test]
+    fn discovery_t8_legacy_requests_are_byte_for_byte_today() {
+        // (T8) Golden: a legacy request (no capability, no field) produces
+        // byte-identical policy and manifest through the discovery entry
+        // point as through the legacy path, and no response field.
+        // One fake shared by both paths: copy it into two dirs.
+        let work = tempfile::tempdir().unwrap();
+        let witness = work.path().display().to_string();
+        let body = normalizer_fake_body(&witness, "true", "true");
+        let binary = write_fake_genpolicy(work.path(), &body);
+        fs::write(
+            work.path().join("success-policy.txt"),
+            synthetic_memory_policy(),
+        )
+        .unwrap();
+        let config = normalizer_config(binary, std::time::Duration::from_secs(30));
+        let legacy = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_log_encryption(&fixed_descriptor(), None)
+                    .await
+            })
+            .expect("legacy path");
+        let discovery = current_thread_runtime()
+            .block_on(async {
+                config
+                    .run_with_pod_group_discovery(&fixed_descriptor(), None, false)
+                    .await
+            })
+            .expect("legacy request through the discovery entry point");
+        assert_eq!(legacy.policy_text, discovery.policy_text);
+        assert_eq!(
+            legacy.invocation.manifest_yaml,
+            discovery.invocation.manifest_yaml
+        );
+        assert_eq!(legacy.pod_supplemental_groups, None);
+        assert_eq!(discovery.pod_supplemental_groups, None);
     }
 }

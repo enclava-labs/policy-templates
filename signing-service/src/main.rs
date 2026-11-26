@@ -104,6 +104,13 @@ struct AgentPolicyRequest {
     descriptor: enclava_policy_signing_service::descriptor::DeploymentDescriptor,
     #[serde(default)]
     log_encryption: Option<enclava_policy_signing_service::descriptor::LogEncryptionConfig>,
+    /// Contract v1 (policy-templates#23): the caller understands the
+    /// pod_supplemental_groups response field and will merge + re-call.
+    /// False (or absent) = legacy: no discovery, and a guest-pull group
+    /// failure surfaces the typed genpolicy_guest_pull_groups_required
+    /// error carrying the missing groups.
+    #[serde(default)]
+    supports_pod_supplemental_groups: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +120,12 @@ struct AgentPolicyResponse {
     genpolicy_version_pin: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     log_encryption: Option<enclava_policy_signing_service::descriptor::LogEncryptionConfig>,
+    /// Present ONLY when this policy came from the guest-pull group
+    /// discovery (contract v1): the effective pod-level supplemental
+    /// groups, sorted unique. Client contract: merge into the descriptor,
+    /// re-call, use only the re-call's policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pod_supplemental_groups: Option<Vec<i64>>,
 }
 
 #[tokio::main]
@@ -211,9 +224,28 @@ async fn generate_agent_policy(
     if req.descriptor.schema_version != "v1" {
         return Err(AppError(anyhow!("unsupported descriptor schema_version")));
     }
+    // Defense in depth: the admission bounds mirror enclava-common's so the
+    // generation path never renders a policy for a reserved or unbounded
+    // declared list (2026-11-25 review on the canonical-record fix).
+    if let Err(reason) =
+        enclava_policy_signing_service::descriptor::validate_pod_supplemental_groups(
+            req.descriptor.pod_supplemental_groups.as_ref(),
+        )
+    {
+        return Err(AppError(anyhow!(
+            "pod_supplemental_groups rejected: {reason}"
+        )));
+    }
+    // Guest-pull group discovery is capability-gated (contract v1); a
+    // legacy request (no capability) keeps today's generation path, with
+    // the typed guest-pull error when genpolicy demands declared groups.
     let generated = state
         .genpolicy
-        .run_with_log_encryption(&req.descriptor, req.log_encryption.as_ref())
+        .run_with_pod_group_discovery(
+            &req.descriptor,
+            req.log_encryption.as_ref(),
+            req.supports_pod_supplemental_groups,
+        )
         .await?;
     let agent_policy_sha256 = hex::encode(Sha256::digest(generated.policy_text.as_bytes()));
     Ok(Json(AgentPolicyResponse {
@@ -221,6 +253,7 @@ async fn generate_agent_policy(
         agent_policy_sha256,
         genpolicy_version_pin: generated.invocation.version_pin,
         log_encryption: req.log_encryption,
+        pod_supplemental_groups: generated.pod_supplemental_groups,
     }))
 }
 

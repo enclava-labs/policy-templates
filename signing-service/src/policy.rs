@@ -142,6 +142,14 @@ pub fn verify_signing_inputs(
     let keyring = verify_keyring(&blobs.keyring_envelope, trusted_owner)?;
     let deployer = find_deployer_pubkey(keyring, &blobs.descriptor_envelope.signing_pubkey)?;
     let descriptor = verify_descriptor(&blobs.descriptor_envelope, &deployer)?;
+    // Defense in depth: the admission bounds mirror enclava-common's so a
+    // hand-crafted envelope from a valid keyring member cannot grant a
+    // reserved gid (2026-11-25 review on the canonical-record fix).
+    if let Err(reason) = crate::descriptor::validate_pod_supplemental_groups(
+        descriptor.pod_supplemental_groups.as_ref(),
+    ) {
+        bail!("pod_supplemental_groups rejected: {reason}");
+    }
     // A valid signature does not make an ambiguous descriptor safe: duplicate
     // resource names diverge between first-match shape selection and
     // last-wins manifest serialization downstream in genpolicy.
@@ -448,6 +456,7 @@ mod tests {
         GeneratedAgentPolicy {
             policy_text: "package agent_policy\n\ndefault CreateContainerRequest := true\n"
                 .to_string(),
+            pod_supplemental_groups: None,
             invocation: GenpolicyInvocation {
                 binary: PathBuf::from("genpolicy"),
                 args: vec!["-y".to_string(), "pod.yaml".to_string()],

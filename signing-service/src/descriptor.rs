@@ -128,6 +128,14 @@ pub struct DeploymentDescriptor {
     pub tee_domain: String,
     #[serde(default)]
     pub custom_domains: Vec<String>,
+    /// Pod-level supplemental groups the deployment DECLARES (contract v1
+    /// of the guest-pull group discovery, policy-templates#23). Absent =
+    /// legacy descriptor: the manifest renders the platform baseline
+    /// [0, 6] and nothing changes. Canonical form (CAP side): sorted
+    /// unique. Optional + skipped when absent so legacy descriptor bytes
+    /// and their hashes are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_supplemental_groups: Option<Vec<i64>>,
 
     pub namespace: String,
     pub service_account: String,
@@ -191,6 +199,40 @@ mod hex_measurement {
             len => Err(D::Error::custom(format!("len {len} != 32 or 48"))),
         }
     }
+}
+
+/// Admission validation for the declared pod supplemental groups, mirroring
+/// enclava-common's `validate_pod_supplemental_groups` (contract v1,
+/// policy-templates#23) so the service never signs or generates a policy
+/// for a list CAP would refuse. Some(list) must carry 1..=32 entries in
+/// 0..=2147483646 and MUST contain the platform baseline members 0 and 6;
+/// the reserved gids (10001 workload owner, 10002 ssh-relay, 65535
+/// nobody-legacy) are rejected by name — a declared list grants every
+/// container in the pod that identity. None (legacy) is always valid.
+pub fn validate_pod_supplemental_groups(groups: Option<&Vec<i64>>) -> Result<(), String> {
+    let Some(groups) = groups else {
+        return Ok(());
+    };
+    if groups.is_empty() || groups.len() > 32 {
+        return Err("pod_supplemental_groups must carry 1 to 32 entries".to_string());
+    }
+    if groups.iter().any(|g| !(0..=2147483646).contains(g)) {
+        return Err("pod_supplemental_groups entries must be in 0..=2147483646".to_string());
+    }
+    if !groups.contains(&0) || !groups.contains(&6) {
+        return Err(
+            "pod_supplemental_groups must contain the platform baseline 0 and 6".to_string(),
+        );
+    }
+    for reserved in [10001, 10002, 65535] {
+        if groups.contains(&reserved) {
+            return Err(format!(
+                "pod_supplemental_groups must not contain the reserved gid {reserved} \
+                 (10001 workload owner, 10002 ssh-relay, 65535 nobody-legacy)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_descriptor<'a>(
@@ -362,6 +404,21 @@ pub fn canonical_oci_spec_bytes(oci: &OciRuntimeSpec) -> [u8; 32] {
     ])
 }
 
+/// Canonical decimal render of the declared pod supplemental groups:
+/// sorted, deduplicated, comma-joined — byte-identical to enclava-common's
+/// `canonical_pod_groups_string` (cap#421) so the deployer's signature
+/// verifies on both sides.
+fn canonical_pod_groups_string(groups: &[i64]) -> String {
+    let mut sorted: Vec<i64> = groups.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .iter()
+        .map(|g| g.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 pub fn descriptor_canonical_bytes(descriptor: &DeploymentDescriptor) -> Vec<u8> {
     let sub = DescriptorSubHashes::new(descriptor);
     let records = descriptor_records(descriptor, b"enclava-deployment-descriptor-v1", true, &sub);
@@ -441,6 +498,15 @@ fn descriptor_records<'a>(
     if descriptor.independent_verification {
         records.push(("independent_verification", b"true"));
     }
+    // The declared pod supplemental groups join the canonical bytes exactly
+    // as enclava-common (cap#421) renders them — same record, same position,
+    // same sorted-unique decimal form. The 2026-11-25 plain-deploy 409 was
+    // this record missing: the CLI signed over bytes that included it, the
+    // service verified over bytes without it, and every groups-declaring
+    // descriptor failed verify_descriptor before /sign's generation step.
+    if let Some(bytes) = sub.pod_groups_bytes.as_deref() {
+        records.push(("pod_supplemental_groups", bytes.as_bytes()));
+    }
     if include_chain_anchors {
         records.push((
             "expected_agent_policy_hash",
@@ -461,6 +527,10 @@ fn descriptor_records<'a>(
 struct DescriptorSubHashes {
     created_at: String,
     custom_domains_hash: [u8; 32],
+    /// Canonical decimal render of the declared pod supplemental groups;
+    /// present only when the descriptor declares groups. Mirrors
+    /// enclava-common's sub-hash so both sides hash identical bytes.
+    pod_groups_bytes: Option<String>,
     signer_hash: [u8; 32],
     oci_hash: [u8; 32],
     sidecar_hash: [u8; 32],
@@ -471,6 +541,10 @@ impl DescriptorSubHashes {
         Self {
             created_at: descriptor.created_at.to_rfc3339(),
             custom_domains_hash: canonical_string_list_bytes(&descriptor.custom_domains),
+            pod_groups_bytes: descriptor
+                .pod_supplemental_groups
+                .as_ref()
+                .map(|groups| canonical_pod_groups_string(groups)),
             signer_hash: canonical_signer_bytes(&descriptor.signer_identity),
             oci_hash: canonical_oci_spec_bytes(&descriptor.oci_runtime_spec),
             sidecar_hash: canonical_sidecar_map_bytes(&descriptor.sidecars),
@@ -535,6 +609,7 @@ pub(crate) mod hex_signature {
 pub mod tests {
     use super::*;
     use chrono::TimeZone;
+    use sha2::{Digest, Sha256};
 
     pub fn fixed_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
@@ -549,6 +624,7 @@ pub mod tests {
             app_domain: "demo.abcd1234.enclava.dev".to_string(),
             tee_domain: "demo.abcd1234.tee.enclava.dev".to_string(),
             custom_domains: vec!["app.example.com".to_string()],
+            pod_supplemental_groups: None,
             namespace: "cap-abcd1234-demo".to_string(),
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [9; 32],
@@ -605,6 +681,122 @@ pub mod tests {
             hex::encode(descriptor_core_hash(&fixed_descriptor())),
             "1e1758ef9f3235eba697bb71672e69ca27f353ebffa94e7d186f33ebd39932de"
         );
+    }
+
+    /// 2026-11-25 plain-deploy 409: the deployer's signature over a
+    /// groups-declaring descriptor must verify. The CLI (enclava-common
+    /// cap#421) signs over canonical bytes that include the
+    /// pod_supplemental_groups record; before this fix the service's
+    /// canonical bytes excluded it, verify_descriptor failed every
+    /// groups-declaring envelope, and /sign refused before generation —
+    /// which CAP masked as 409 idempotency_recovery_required.
+    #[test]
+    fn declared_groups_descriptor_signature_verifies() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let mut descriptor = fixed_descriptor();
+        descriptor.pod_supplemental_groups = Some(vec![0, 6, 27]);
+        let signing = SigningKey::from_bytes(&[0x44; 32]);
+        let envelope = DeploymentDescriptorEnvelope {
+            signature: signing.sign(&descriptor_canonical_bytes(&descriptor)),
+            descriptor,
+            signing_key_id: "deployer".to_string(),
+            signing_pubkey: signing.verifying_key(),
+        };
+        verify_descriptor(&envelope, &signing.verifying_key())
+            .expect("the deployer's signature must verify for a groups-declaring descriptor");
+
+        // Legacy descriptors keep verifying identically.
+        let legacy = fixed_descriptor();
+        let legacy_envelope = DeploymentDescriptorEnvelope {
+            signature: signing.sign(&descriptor_canonical_bytes(&legacy)),
+            descriptor: legacy,
+            signing_key_id: "deployer".to_string(),
+            signing_pubkey: signing.verifying_key(),
+        };
+        verify_descriptor(&legacy_envelope, &signing.verifying_key())
+            .expect("legacy descriptors keep verifying");
+    }
+
+    /// The declared list joins the canonical bytes only when present, in
+    /// the sorted-unique canonical form — byte-identical to enclava-common
+    /// (cap#421) so the two sides cannot drift again silently.
+    #[test]
+    fn declared_groups_join_the_canonical_bytes_only_when_declared() {
+        let legacy = fixed_descriptor();
+        let mut declared = fixed_descriptor();
+        declared.pod_supplemental_groups = Some(vec![0, 6, 27]);
+        assert_ne!(
+            descriptor_core_hash(&legacy),
+            descriptor_core_hash(&declared),
+            "a declared list must change the signed bytes"
+        );
+        assert_ne!(
+            Sha256::digest(descriptor_canonical_bytes(&legacy)),
+            Sha256::digest(descriptor_canonical_bytes(&declared)),
+            "the full signing form changes too"
+        );
+        let mut unsorted = fixed_descriptor();
+        unsorted.pod_supplemental_groups = Some(vec![27, 6, 0, 27]);
+        assert_eq!(
+            descriptor_core_canonical_bytes(&declared),
+            descriptor_core_canonical_bytes(&unsorted),
+            "unsorted/duplicated input canonicalizes to the same bytes"
+        );
+        let mut other = fixed_descriptor();
+        other.pod_supplemental_groups = Some(vec![0, 6, 55]);
+        assert_ne!(
+            descriptor_core_canonical_bytes(&declared),
+            descriptor_core_canonical_bytes(&other)
+        );
+    }
+
+    /// Pinned vectors: the fixture's core AND full canonical hashes with the
+    /// declared groups [0, 6, 27], plus the unsorted/duplicate input's core
+    /// hash — so dedup-semantics or record-position drift fails
+    /// byte-exactly on this side, in both forms CAP signs.
+    #[test]
+    fn declared_groups_hashes_are_pinned() {
+        let mut descriptor = fixed_descriptor();
+        descriptor.pod_supplemental_groups = Some(vec![0, 6, 27]);
+        assert_eq!(
+            hex::encode(descriptor_core_hash(&descriptor)),
+            "e7db33071fb4a0c166cfcad973061072da9e7eaf3d1e2e50796dd7363c7aab80"
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(descriptor_canonical_bytes(&descriptor))),
+            "36a7c4dd6a4094ddf264a3b7683416b4c50e51590f6e3166cb37dbbfd765171d"
+        );
+        let mut unsorted = fixed_descriptor();
+        unsorted.pod_supplemental_groups = Some(vec![27, 6, 0, 27]);
+        assert_eq!(
+            hex::encode(descriptor_core_hash(&unsorted)),
+            "e7db33071fb4a0c166cfcad973061072da9e7eaf3d1e2e50796dd7363c7aab80",
+            "unsorted/duplicated input canonicalizes to the pinned bytes"
+        );
+    }
+
+    /// The admission bounds mirror enclava-common's: 1..=32 entries,
+    /// 0..=2147483646, the baseline members 0 and 6, and the reserved
+    /// gids rejected by name. None (legacy) is always valid.
+    #[test]
+    fn declared_groups_admission_validation() {
+        assert!(validate_pod_supplemental_groups(None).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![0, 6])).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![6, 0, 27])).is_ok());
+        assert!(validate_pod_supplemental_groups(Some(&vec![0, 27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&vec![6, 27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&vec![27])).is_err());
+        assert!(validate_pod_supplemental_groups(Some(&Vec::new())).is_err());
+        let mut many = vec![0, 6];
+        many.extend(std::iter::repeat_n(27, 31));
+        assert_eq!(many.len(), 33);
+        assert!(validate_pod_supplemental_groups(Some(&many)).is_err());
+        for reserved in [10001, 10002, 65535] {
+            assert!(
+                validate_pod_supplemental_groups(Some(&vec![0, 6, reserved])).is_err(),
+                "reserved gid {reserved} must be rejected"
+            );
+        }
     }
 
     #[test]
