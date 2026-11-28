@@ -5540,7 +5540,12 @@ exit 101
             let mut window: Vec<u8> = Vec::with_capacity(size);
             let filler = b"filler line with ordinary log bytes 0123456789\n";
             let mut planted = 0usize;
-            while window.len() < size {
+            // The final segment of the window is a planted wrapped block,
+            // so the 512-byte tail the renderer returns provably carries
+            // it: the tail assertion is non-vacuous (the raw marker never
+            // appears in the window, only its encoded form).
+            let body = size.saturating_sub(wrapped.len() + 1);
+            while window.len() < body {
                 if planted.is_multiple_of(16) {
                     for chunk in wrapped.as_bytes().chunks(76) {
                         window.extend_from_slice(chunk);
@@ -5552,12 +5557,27 @@ exit 101
                     planted += 1;
                 }
             }
+            window.truncate(body);
+            for chunk in wrapped.as_bytes().chunks(76) {
+                window.extend_from_slice(chunk);
+                window.push(b'\n');
+            }
             window.truncate(size);
             let needles = redaction_needles(&secrets);
             let start = Instant::now();
             let rendered = render_output_tail(&window, &needles);
             let elapsed = start.elapsed();
             println!("render_output_tail window {size} bytes: {elapsed:?}");
+            let stripped: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+            let stripped_wrapped: String = wrapped.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !stripped.contains(&stripped_wrapped),
+                "the planted wrapped encoding leaked (recoverable by stripping whitespace)"
+            );
+            assert!(
+                rendered.contains("[redacted]"),
+                "the planted wrapped encoding in the tail region was not redacted: {rendered}"
+            );
             assert!(
                 !rendered.contains(marker),
                 "the cost window must still redact the planted credential"
