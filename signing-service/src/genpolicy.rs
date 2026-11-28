@@ -790,6 +790,55 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
             }
         }
     }
+    // (follow-up, defense in depth) Credential-shaped fields OUTSIDE the
+    // auths map: the operator's own REGISTRY_AUTH_FILE can carry an
+    // HttpHeaders.Authorization (bearer credential echoed as a bare
+    // value), a top-level `tokens` map (QA caveat), or other top-level
+    // credential keys. The whole-file needle only catches a verbatim
+    // echo, so these fields become value needles like the auths ones.
+    // Registry hostnames and non-credential usernames stay surviving
+    // context: only credential-shaped keys are walked.
+    if let Some(map) = parsed.as_object() {
+        for (key, value) in map {
+            match key.as_str() {
+                "auths" | "HttpHeaders" => continue,
+                "tokens" => {
+                    if let Some(tokens) = value.as_object() {
+                        for token in tokens.values() {
+                            if let Value::String(token) = token {
+                                if !token.is_empty() {
+                                    values.push(token.as_bytes().to_vec());
+                                }
+                            }
+                        }
+                    }
+                }
+                "identitytoken" | "registrytoken" | "password" | "email" => {
+                    if let Value::String(value) = value {
+                        if !value.is_empty() {
+                            values.push(value.as_bytes().to_vec());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // HttpHeaders.Authorization: the whole value AND the credential after
+    // the auth-scheme prefix (a child echoing the bare token, not the
+    // "Bearer <token>" form).
+    if let Some(headers) = parsed.get("HttpHeaders").and_then(Value::as_object) {
+        if let Some(Value::String(authorization)) = headers.get("Authorization") {
+            if !authorization.is_empty() {
+                values.push(authorization.as_bytes().to_vec());
+                if let Some((_, credential)) = authorization.split_once(' ') {
+                    if !credential.is_empty() {
+                        values.push(credential.as_bytes().to_vec());
+                    }
+                }
+            }
+        }
+    }
     // Base64 `auth` tokens decode to `user:password`; redact the decoded
     // pair and the password half in addition to the token itself.
     if let Some(auths) = parsed.get("auths").and_then(Value::as_object) {
@@ -829,14 +878,30 @@ fn credential_values(document: &[u8]) -> Vec<Vec<u8>> {
 /// each matched span back through the index map — separators INSIDE the
 /// span are removed with it. Runs IN ADDITION to the contiguous pass.
 fn redact_separated_encodings(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
+    // Cheap prefilter: with no separator byte in the buffer there is
+    // nothing to strip, so the canonical copy equals the input and every
+    // match the separated pass could find is already a contiguous match
+    // (the pass runs after the contiguous one). Pass through unchanged.
+    if !haystack
+        .iter()
+        .any(|&b| matches!(b, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        return haystack.to_vec();
+    }
+    // The window is bounded by LOG_TAIL_INPUT_MAX_BYTES plus the
+    // longest-needle lookback, so u32 indices are always sufficient;
+    // the guard keeps the invariant honest for any direct caller.
+    if haystack.len() > u32::MAX as usize {
+        return haystack.to_vec();
+    }
     let mut canonical = Vec::with_capacity(haystack.len());
-    let mut original_index = Vec::with_capacity(haystack.len());
+    let mut original_index: Vec<u32> = Vec::with_capacity(haystack.len());
     for (i, &b) in haystack.iter().enumerate() {
         if matches!(b, b' ' | b'\n' | b'\r' | b'\t') {
             continue;
         }
         canonical.push(b);
-        original_index.push(i);
+        original_index.push(i as u32);
     }
     let mut consumed = vec![false; canonical.len()];
     for needle in needles {
@@ -848,10 +913,14 @@ fn redact_separated_encodings(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
             // stripping (their byte IS the match — blanking one byte).
             continue;
         }
+        let first = needle[0];
         let mut i = 0;
         while i + needle.len() <= canonical.len() {
             let end = i + needle.len();
-            if !consumed[i..end].contains(&true) && canonical[i..end] == needle[..] {
+            if canonical[i] == first
+                && !consumed[i..end].contains(&true)
+                && canonical[i..end] == needle[..]
+            {
                 for slot in &mut consumed[i..end] {
                     *slot = true;
                 }
@@ -873,23 +942,29 @@ fn redact_separated_encodings(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
         } else if let Some(start) = run_start.take() {
             for original in blanked
                 .iter_mut()
-                .take(original_index[pos - 1] + 1)
-                .skip(original_index[start])
+                .take(original_index[pos - 1] as usize + 1)
+                .skip(original_index[start] as usize)
             {
                 *original = true;
             }
         }
     }
     if let Some(start) = run_start {
-        let last = original_index[canonical.len() - 1];
+        let last = original_index[canonical.len() - 1] as usize;
         for original in blanked
             .iter_mut()
             .take(last + 1)
-            .skip(original_index[start])
+            .skip(original_index[start] as usize)
         {
             *original = true;
         }
     }
+    emit_replacements(haystack, &blanked)
+}
+
+/// Emit a buffer with every blanked run replaced by the marker, in one
+/// allocation, reading the input in place (no intermediate copies).
+fn emit_replacements(haystack: &[u8], blanked: &[bool]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut i = 0;
     while i < haystack.len() {
@@ -904,6 +979,40 @@ fn redact_separated_encodings(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Contiguous-pass redaction in a single allocation: mark every needle
+/// match on a blanked bitmap — longest-first, never consuming an
+/// already-blanked span (the needles list arrives sorted by
+/// `redaction_needles`, preserving the old sequential-replace semantics:
+/// a shorter needle landing inside a longer needle's span is skipped) —
+/// then emit once. The first-byte gate keeps the per-position cost at one
+/// byte compare instead of a slice compare per needle.
+fn redact_contiguous(haystack: &[u8], needles: &[Vec<u8>]) -> Vec<u8> {
+    let mut blanked = vec![false; haystack.len()];
+    for needle in needles {
+        let needle = needle.as_slice();
+        if needle.is_empty() || needle.len() > haystack.len() {
+            continue;
+        }
+        let first = needle[0];
+        let mut i = 0;
+        while i + needle.len() <= haystack.len() {
+            let end = i + needle.len();
+            if haystack[i] == first
+                && !blanked[i..end].contains(&true)
+                && haystack[i..end] == *needle
+            {
+                for slot in &mut blanked[i..end] {
+                    *slot = true;
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    emit_replacements(haystack, &blanked)
 }
 
 /// Common encodings of one secret byte string: raw, hex (lower and upper),
@@ -992,28 +1101,6 @@ fn redaction_needles(secrets: &[Vec<u8>]) -> Vec<Vec<u8>> {
     needles
 }
 
-/// Byte-level `haystack[needle] -> replacement` (credential bytes need not
-/// be valid UTF-8).
-fn replace_bytes(mut haystack: Vec<u8>, needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if needle.is_empty() {
-        return haystack;
-    }
-    let mut out: Vec<u8> = Vec::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < haystack.len() {
-        if haystack[i..].starts_with(needle) {
-            out.extend_from_slice(replacement);
-            i += needle.len();
-        } else {
-            out.push(haystack[i]);
-            i += 1;
-        }
-    }
-    haystack.clear();
-    haystack.extend_from_slice(&out);
-    haystack
-}
-
 /// Render a child stream tail for a log line: REDACT-THEN-SLICE — every
 /// redaction needle (credential documents, extracted values, and their
 /// common encodings) is replaced over the WHOLE captured buffer FIRST,
@@ -1021,16 +1108,16 @@ fn replace_bytes(mut haystack: Vec<u8>, needle: &[u8], replacement: &[u8]) -> Ve
 /// secret straddling the tail boundary can never leak its trailing bytes
 /// (QA F-A; the buffer is the already-captured stream, so this stays
 /// bounded). Newlines are flattened so the tail stays on one log line.
-fn render_output_tail(bytes: &[u8], secrets: &[Vec<u8>]) -> String {
-    let needles = redaction_needles(secrets);
-    let mut redacted = bytes.to_vec();
-    for needle in &needles {
-        redacted = replace_bytes(redacted, needle, b"[redacted]");
-    }
+fn render_output_tail(bytes: &[u8], needles: &[Vec<u8>]) -> String {
+    // The needle set is computed once by the caller (the async path needs
+    // the longest needle for the window lookback anyway) and shared by
+    // both passes; each pass now marks-and-emits in place instead of
+    // copying the whole buffer once per needle.
+    let redacted = redact_contiguous(bytes, needles);
     // The separated pass catches the interleaved forms the contiguous
     // needles cannot see (R2 item 1): 76-column-wrapped base64,
     // space-separated hex, single-space-joined encodings.
-    redacted = redact_separated_encodings(&redacted, &needles);
+    let redacted = redact_separated_encodings(&redacted, needles);
     let start = redacted.len().saturating_sub(OUTPUT_TAIL_MAX_BYTES);
     String::from_utf8_lossy(&redacted[start..])
         .replace('\r', "\\r")
@@ -1050,7 +1137,7 @@ async fn redacted_tail_for_log(bytes: Vec<u8>, secrets: Vec<Vec<u8>>) -> String 
         .len()
         .saturating_sub(LOG_TAIL_INPUT_MAX_BYTES + lookback);
     let window = bytes[window_start..].to_vec();
-    tokio::task::spawn_blocking(move || render_output_tail(&window, &secrets))
+    tokio::task::spawn_blocking(move || render_output_tail(&window, &needles))
         .await
         .unwrap_or_else(|_| "[redacted render unavailable]".to_string())
 }
@@ -5371,6 +5458,135 @@ exit 101
             captured.contains("[redacted]"),
             "the pair was replaced wholesale: {captured}"
         );
+    }
+
+    #[test]
+    fn sibling_credential_fields_outside_auths_are_redacted() {
+        // (follow-up, defense in depth): a credential sitting OUTSIDE the
+        // auths map of the operator's REGISTRY_AUTH_FILE — an
+        // HttpHeaders.Authorization echoed as a bare value, a top-level
+        // tokens map — was not blanked by the field walk; the whole-file
+        // needle catches a verbatim echo only. Those fields are value
+        // needles now (the bare bearer credential after the scheme too),
+        // while registry hostnames and non-credential context survive.
+        let header_marker = "SECRETMARKER-DO-NOT-LOG-HEADER-AUTH-0123456789";
+        let token_marker = "SECRETMARKER-DO-NOT-LOG-TOKENS-MAP-0123456789";
+        let password_marker = "SECRETMARKER-DO-NOT-LOG-PASSWORD-0123456789";
+        let document = format!(
+            r#"{{"auths":{{"ghcr.io":{{"username":"qa-user","password":"{password_marker}"}}}},"HttpHeaders":{{"Authorization":"Bearer {header_marker}","User-Agent":"docker/27.3"}},"tokens":{{"ghcr.io":"{token_marker}"}}}}"#
+        );
+        let values = credential_values(document.as_bytes());
+        assert!(
+            values.iter().any(|v| v == header_marker.as_bytes()),
+            "the bare bearer credential is a value needle: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v == token_marker.as_bytes()),
+            "the tokens-map value is a value needle: {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v == password_marker.as_bytes()),
+            "the auths password stays a value needle: {values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v == b"ghcr.io"),
+            "registry hostnames are not needles: {values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v == b"docker/27.3"),
+            "non-credential header context is not a needle: {values:?}"
+        );
+        // The render blanks the bare echoes and the encoding of the new
+        // value needle, and keeps the non-credential context:
+        let secrets = vec![document.clone().into_bytes()];
+        let needles = redaction_needles(&secrets);
+        let hexed = hex::encode(header_marker.as_bytes());
+        let echoed = format!(
+            "Authorization: Bearer {header_marker} bare={header_marker} tokens={token_marker} pw={password_marker} hex={hexed} host=ghcr.io agent=docker/27.3"
+        );
+        let rendered = render_output_tail(echoed.as_bytes(), &needles);
+        for marker in [header_marker, token_marker, password_marker] {
+            assert!(!rendered.contains(marker), "leaked {marker}: {rendered}");
+        }
+        assert!(
+            !rendered.contains(&hexed),
+            "the hex encoding of a sibling credential leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("ghcr.io") && rendered.contains("docker/27.3"),
+            "non-credential context must survive: {rendered}"
+        );
+    }
+
+    #[test]
+    #[ignore = "cost harness: run with --release and --ignored; the numbers go in the PR body"]
+    fn render_output_tail_window_cost_at_three_window_sizes() {
+        // A realistic credential set (an auth file whose walk yields the
+        // token, the decoded pair, the password half and the username,
+        // each expanded into its encodings — the anonymous-attempt shape)
+        // against the adversarial window: mostly filler lines, with the
+        // credential's base64 DEFAULT-WRAPPED at 76 columns planted
+        // repeatedly so the separated pass does its real work, plus a
+        // few raw echoes. Asserts a generous regression bound and prints
+        // the per-window render time for the before/after table.
+        use base64::Engine;
+        use std::time::{Duration, Instant};
+        let marker = "SECRETMARKER-DO-NOT-LOG-COST-0123456789-ABCDEFGHIJ";
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("qa-user:{marker}"));
+        let document = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{token}"}}}}}}"#);
+        let secrets = vec![document.clone().into_bytes()];
+        let wrapped = base64::engine::general_purpose::STANDARD.encode(&document);
+        for &size in &[64 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+            let mut window: Vec<u8> = Vec::with_capacity(size);
+            let filler = b"filler line with ordinary log bytes 0123456789\n";
+            let mut planted = 0usize;
+            // The final segment of the window is a planted wrapped block,
+            // so the 512-byte tail the renderer returns provably carries
+            // it: the tail assertion is non-vacuous (the raw marker never
+            // appears in the window, only its encoded form).
+            let body = size.saturating_sub(wrapped.len() + 1);
+            while window.len() < body {
+                if planted.is_multiple_of(16) {
+                    for chunk in wrapped.as_bytes().chunks(76) {
+                        window.extend_from_slice(chunk);
+                        window.push(b'\n');
+                    }
+                    planted += 1;
+                } else {
+                    window.extend_from_slice(filler);
+                    planted += 1;
+                }
+            }
+            window.truncate(body);
+            for chunk in wrapped.as_bytes().chunks(76) {
+                window.extend_from_slice(chunk);
+                window.push(b'\n');
+            }
+            window.truncate(size);
+            let needles = redaction_needles(&secrets);
+            let start = Instant::now();
+            let rendered = render_output_tail(&window, &needles);
+            let elapsed = start.elapsed();
+            println!("render_output_tail window {size} bytes: {elapsed:?}");
+            let stripped: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+            let stripped_wrapped: String = wrapped.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !stripped.contains(&stripped_wrapped),
+                "the planted wrapped encoding leaked (recoverable by stripping whitespace)"
+            );
+            assert!(
+                rendered.contains("[redacted]"),
+                "the planted wrapped encoding in the tail region was not redacted: {rendered}"
+            );
+            assert!(
+                !rendered.contains(marker),
+                "the cost window must still redact the planted credential"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "the {size}-byte window render took {elapsed:?} (regression bound 10 s)"
+            );
+        }
     }
 
     #[test]
